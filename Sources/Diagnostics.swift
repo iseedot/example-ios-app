@@ -166,7 +166,6 @@ enum Diagnostics {
         payload["audioSession"] = [
             "category": session.category.rawValue,
             "mode": session.mode.rawValue,
-            "isActive": "\(session.isActive)",
             "outputVolume": String(format: "%.2f", session.outputVolume),
             "isOtherAudioPlaying": "\(session.isOtherAudioPlaying)",
             "secondaryAudioShouldBeSilencedHint": "\(session.secondaryAudioShouldBeSilencedHint)",
