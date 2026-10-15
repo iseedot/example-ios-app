@@ -24,6 +24,7 @@ xcrun -sdk iphoneos swiftc \
   -module-name "$APP_NAME" \
   -framework Foundation -framework UIKit -framework SwiftUI \
   -framework AudioToolbox -framework AVFAudio -framework AVFoundation \
+  -framework MediaPlayer -framework CoreFoundation \
   -o "$APP_DIR/$APP_NAME" \
   Sources/*.swift
 

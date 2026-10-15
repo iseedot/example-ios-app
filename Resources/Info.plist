@@ -41,6 +41,9 @@
 	</array>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<false/>
+	<!-- 锁屏状态下仍让界面存活（目标软件同样设置了这一项） -->
+	<key>UIApplicationShowsViewsWhileLocked</key>
+	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
@@ -49,6 +52,18 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<!-- 图标隐藏后仍可从 Safari / 文件 App 打开（恢复入口） -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.example.mycallrec.url</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>mycallrec</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>录制通话与环境音</string>
 	<key>NSContactsUsageDescription</key>

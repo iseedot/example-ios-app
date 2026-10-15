@@ -93,6 +93,15 @@ public final class TapRecorder {
 
     public private(set) var isRunning = false
 
+    /// Highest sample magnitude in the most recent buffer (0...1). A non-zero value
+    /// proves the tap is delivering audio rather than silence.
+    public private(set) var peakAmplitude: Float = 0
+    /// Highest magnitude observed since the recording started.
+    public private(set) var maxPeakAmplitude: Float = 0
+    /// Set once the first non-empty buffer arrives; distinguishes "entitlement missing"
+    /// from "target produced nothing".
+    public private(set) var receivedFirstBuffer = false
+
     public var packetsWritten: UInt64 {
         lock.lock(); defer { lock.unlock() }
         return storedPackets
@@ -206,6 +215,11 @@ public final class TapRecorder {
 
     fileprivate func handle(buffer: AudioQueueBufferRef, queue: AudioQueueRef) {
         let byteCount = buffer.pointee.mAudioDataByteSize
+        if byteCount > 0, !receivedFirstBuffer {
+            receivedFirstBuffer = true
+            trlog(.info, "TAP", "第一个音频缓冲区到达 (\(byteCount) 字节)")
+        }
+        updatePeak(from: buffer, byteCount: byteCount)
         if byteCount > 0, let file {
             let bytesPerPacket = format.mBytesPerPacket != 0 ? format.mBytesPerPacket : 4 * format.mChannelsPerFrame
             var packets = byteCount / bytesPerPacket
@@ -223,6 +237,23 @@ public final class TapRecorder {
         if isRunning {
             AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
         }
+    }
+
+    /// Samples the buffer to report a peak level; a cheap way to tell audio from silence.
+    private func updatePeak(from buffer: AudioQueueBufferRef, byteCount: UInt32) {
+        guard byteCount >= 4, format.mBitsPerChannel == 32,
+              let data = buffer.pointee.mAudioData else { return }
+        let sampleCount = Int(byteCount) / MemoryLayout<Float32>.size
+        let samples = data.assumingMemoryBound(to: Float32.self)
+        var peak: Float = 0
+        var index = 0
+        while index < sampleCount {
+            let value = abs(samples[index])
+            if value > peak { peak = value }
+            index += 4
+        }
+        peakAmplitude = peak
+        if peak > maxPeakAmplitude { maxPeakAmplitude = peak }
     }
 
     public func stop() {

@@ -1,9 +1,14 @@
 //
 //  CallWatcher.swift
-//  callrec — Phase 1 proof of concept, Swift implementation.
+//  MyCallRec — Phase 1 proof of concept.
 //
-//  Observes telephone call state with the CoreTelephony notification centre. The
-//  private symbols are resolved with dlsym, so no private headers are required.
+//  Observes telephone call state with the CoreTelephony notification centre.
+//  The private symbols are resolved at runtime, so the app links against the public
+//  SDK only and does not need CoreTelephony's private headers.
+//
+//  Note: CoreTelephony ships in /System/Library/Frameworks, not PrivateFrameworks.
+//  The candidate list below is tried in order and the failure reason is reported so
+//  a device log alone is enough to diagnose a mismatch.
 //
 
 import Foundation
@@ -17,12 +22,29 @@ public enum CallState: Int32 {
     case outgoingInitiated = 3
     case incoming = 4
     case incomingEnded = 5
+
+    public var label: String {
+        switch self {
+        case .unknown: return "未知"
+        case .answered: return "已接通"
+        case .droppedInterrupted: return "通话中断"
+        case .outgoingInitiated: return "去电呼叫中"
+        case .incoming: return "来电"
+        case .incomingEnded: return "来电结束"
+        }
+    }
+
+    /// True when the call has ended and a recording should stop.
+    public var isTerminal: Bool {
+        self == .droppedInterrupted || self == .incomingEnded
+    }
 }
 
 public struct CallEvent {
     public let notification: String
     public let state: CallState
     public let activeCallCount: Int32
+    public let onlyCall: Bool
     public let address: String?
     public let displayName: String?
     public let uniqueIdentifier: String?
@@ -40,9 +62,17 @@ private typealias CallCopyStringFn = @convention(c) (CFAllocator?, UnsafeMutable
 private typealias CurrentCallCountFn = @convention(c) () -> Int32
 
 public final class CallWatcher {
-    private static let frameworkPath = "/System/Library/PrivateFrameworks/CoreTelephony.framework/CoreTelephony"
+    /// Tried in order. The first entry is where CoreTelephony actually lives on iOS.
+    private static let candidatePaths = [
+        "/System/Library/Frameworks/CoreTelephony.framework/CoreTelephony",
+        "/System/Library/PrivateFrameworks/CoreTelephony.framework/CoreTelephony",
+    ]
 
+    private static let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+
+    /// Resolved framework handle; nil means the symbols came from an already-loaded image.
     private var handle: UnsafeMutableRawPointer?
+    private var ownsHandle = false
     private var center: CFNotificationCenter?
     private var addObserver: TelephonyCenterAddObserverFn?
     private var removeObserver: TelephonyCenterRemoveObserverFn?
@@ -53,44 +83,106 @@ public final class CallWatcher {
     private var currentCallCount: CurrentCallCountFn?
     private var onEvent: ((CallEvent) -> Void)?
 
-    public static var isAvailable: Bool {
-        guard let handle = dlopen(frameworkPath, RTLD_NOW) else { return false }
-        defer { dlclose(handle) }
-        return dlsym(handle, "CTTelephonyCenterGetDefault") != nil
-            && dlsym(handle, "CTTelephonyCenterAddObserver") != nil
-            && dlsym(handle, "kCTCallStatusChangeNotification") != nil
-    }
+    /// Human-readable resolution outcome, shown in the UI so a failing device needs no debugger.
+    public private(set) var statusDetail = "尚未解析"
 
     public init() {}
 
-    private func symbol<T>(_ name: String, as type: T.Type) -> T? {
-        guard let handle, let pointer = dlsym(handle, name) else { return nil }
+    // MARK: - Symbol resolution
+
+    private static func lookup(_ name: String, in handle: UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer? {
+        if let handle {
+            return dlsym(handle, name)
+        }
+        guard let rtldDefault else { return nil }
+        return dlsym(rtldDefault, name)
+    }
+
+    /// Opens CoreTelephony, or reports why it could not.
+    /// Returns nil when the framework is reachable through an already-loaded image.
+    private static func openFramework() -> (handle: UnsafeMutableRawPointer?, detail: String) {
+        if visibleInGlobalScope() {
+            return (nil, "已加载（dyld 全局作用域）")
+        }
+
+        var lastFailure = "没有可用的候选路径"
+        for path in candidatePaths {
+            guard let candidate = dlopen(path, RTLD_NOW) else {
+                if let error = dlerror() {
+                    lastFailure = "\(path) 打开失败：\(String(cString: error))"
+                } else {
+                    lastFailure = "\(path) 打开失败"
+                }
+                continue
+            }
+            if dlsym(candidate, "CTTelephonyCenterGetDefault") != nil {
+                return (candidate, path)
+            }
+            lastFailure = "\(path) 已加载但缺少 CTTelephonyCenterGetDefault"
+            dlclose(candidate)
+        }
+        return (nil, lastFailure)
+    }
+
+    /// True when the symbols are reachable from an image dyld already loaded.
+    private static func visibleInGlobalScope() -> Bool {
+        guard let rtldDefault else { return false }
+        return dlsym(rtldDefault, "CTTelephonyCenterGetDefault") != nil
+    }
+
+    public static var isAvailable: Bool { probe().available }
+
+    /// Full diagnostic string for the UI / log.
+    public static func probe() -> (available: Bool, detail: String) {
+        let result = openFramework()
+        let available = result.handle != nil || visibleInGlobalScope()
+        // Only the detail string is kept; observation reopens the framework.
+        if let handle = result.handle { dlclose(handle) }
+        return (available, result.detail)
+    }
+
+    private func symbol<T>(_ name: String, as type: T.Type, in handle: UnsafeMutableRawPointer?) -> T? {
+        guard let pointer = Self.lookup(name, in: handle) else { return nil }
         return unsafeBitCast(pointer, to: T.self)
     }
 
+    // MARK: - Observation
+
+    @discardableResult
     public func start(handler: @escaping (CallEvent) -> Void) -> Bool {
         guard center == nil else { return true }
-        guard let handle = dlopen(Self.frameworkPath, RTLD_NOW) else { return false }
-        self.handle = handle
 
-        guard let getDefault = symbol("CTTelephonyCenterGetDefault", as: TelephonyCenterGetDefaultFn.self),
-              let add = symbol("CTTelephonyCenterAddObserver", as: TelephonyCenterAddObserverFn.self) else {
+        let opened = Self.openFramework()
+        handle = opened.handle
+        ownsHandle = opened.handle != nil
+        statusDetail = opened.detail
+
+        guard let getDefault = symbol("CTTelephonyCenterGetDefault", as: TelephonyCenterGetDefaultFn.self,
+                                      in: handle),
+              let add = symbol("CTTelephonyCenterAddObserver", as: TelephonyCenterAddObserverFn.self, in: handle) else {
+            statusDetail = "\(opened.detail)；缺少 CTTelephonyCenterGetDefault/AddObserver"
             return false
         }
         addObserver = add
-        removeObserver = symbol("CTTelephonyCenterRemoveObserver", as: TelephonyCenterRemoveObserverFn.self)
-        getStatus = symbol("CTCallGetStatus", as: CallGetStatusFn.self)
-        copyAddress = symbol("CTCallCopyAddress", as: CallCopyStringFn.self)
-        copyName = symbol("CTCallCopyName", as: CallCopyStringFn.self)
-        copyUniqueID = symbol("CTCallCopyUniqueStringID", as: CallCopyStringFn.self)
-        currentCallCount = symbol("CTGetCurrentCallCount", as: CurrentCallCountFn.self)
+        removeObserver = symbol("CTTelephonyCenterRemoveObserver", as: TelephonyCenterRemoveObserverFn.self, in: handle)
+        getStatus = symbol("CTCallGetStatus", as: CallGetStatusFn.self, in: handle)
+        copyAddress = symbol("CTCallCopyAddress", as: CallCopyStringFn.self, in: handle)
+        copyName = symbol("CTCallCopyName", as: CallCopyStringFn.self, in: handle)
+        copyUniqueID = symbol("CTCallCopyUniqueStringID", as: CallCopyStringFn.self, in: handle)
+        currentCallCount = symbol("CTGetCurrentCallCount", as: CurrentCallCountFn.self, in: handle)
 
-        guard let statusPointer = dlsym(handle, "kCTCallStatusChangeNotification") else { return false }
+        guard let statusPointer = Self.lookup("kCTCallStatusChangeNotification", in: handle) else {
+            statusDetail = "\(opened.detail)；缺少 kCTCallStatusChangeNotification"
+            return false
+        }
         let statusNotification = statusPointer.assumingMemoryBound(to: CFString?.self).pointee
-        let identificationPointer = dlsym(handle, "kCTCallIdentificationChangeNotification")
-        let identificationNotification = identificationPointer?.assumingMemoryBound(to: CFString?.self).pointee
+        let identificationNotification = Self.lookup("kCTCallIdentificationChangeNotification", in: handle)?
+            .assumingMemoryBound(to: CFString?.self).pointee
 
-        guard let telephonyCenter = getDefault() else { return false }
+        guard let telephonyCenter = getDefault() else {
+            statusDetail = "\(opened.detail)；CTTelephonyCenterGetDefault() 返回空"
+            return false
+        }
         center = telephonyCenter
         onEvent = handler
 
@@ -101,24 +193,38 @@ public final class CallWatcher {
             add(telephonyCenter, observer, CallWatcherCallback, identificationNotification, nil,
                 CFNotificationSuspensionBehavior.deliverImmediately)
         }
+        statusDetail = "\(opened.detail)；已注册观察者"
         return true
     }
 
-    fileprivate func dispatch(name: CFNotificationName?, call: UnsafeMutableRawPointer?) {
-        // CTCallCopy* take an allocator as their first argument; NULL means "use the default".
+    fileprivate func dispatch(name: CFNotificationName?, call: UnsafeMutableRawPointer?, payload: CFDictionary?) {
+        // CFDictionary is toll-free bridged; go through AnyObject so the cast is unambiguous.
+        let dictionary: [String: Any]? = {
+            guard let payload else { return nil }
+            let object: AnyObject = payload as AnyObject
+            return object as? [String: Any]
+        }()
+
+        // CTCallGetStatus is authoritative when available, but some events carry the
+        // status only in the notification payload.
+        var state = CallState.unknown
+        if let getStatus, let call {
+            state = CallState(rawValue: getStatus(call)) ?? .unknown
+        }
+        if let rawStatus = dictionary?["kCTCallStatus"] as? Int, let payloadState = CallState(rawValue: Int32(rawStatus)) {
+            state = payloadState
+        }
+
         func string(_ converter: CallCopyStringFn?) -> String? {
             guard let converter, let call, let copied = converter(nil, call) else { return nil }
             return copied as String
         }
 
-        var state = CallState.unknown
-        if let getStatus, let call {
-            state = CallState(rawValue: getStatus(call)) ?? .unknown
-        }
-
+        let onlyCall = (dictionary?["kCTCallIsTheOnlyCall"] as? Bool) ?? true
         let event = CallEvent(notification: name.map { $0.rawValue as String } ?? "",
                               state: state,
                               activeCallCount: currentCallCount?() ?? 0,
+                              onlyCall: onlyCall,
                               address: string(copyAddress),
                               displayName: string(copyName),
                               uniqueIdentifier: string(copyUniqueID))
@@ -131,15 +237,18 @@ public final class CallWatcher {
         }
         center = nil
         onEvent = nil
-        if let handle { dlclose(handle) }
+        if ownsHandle, let handle { dlclose(handle) }
         handle = nil
+        ownsHandle = false
     }
 
     deinit { stop() }
 }
 
-private let CallWatcherCallback: CFNotificationCallback = { _, observer, name, object, _ in
+private let CallWatcherCallback: CFNotificationCallback = { _, observer, name, object, payload in
     guard let observer else { return }
     let watcher = Unmanaged<CallWatcher>.fromOpaque(observer).takeUnretainedValue()
-    watcher.dispatch(name: name, call: UnsafeMutableRawPointer(mutating: object))
+    watcher.dispatch(name: name,
+                     call: UnsafeMutableRawPointer(mutating: object),
+                     payload: payload)
 }

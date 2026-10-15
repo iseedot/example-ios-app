@@ -46,6 +46,23 @@
 		<string>modify-calls</string>
 	</array>
 
+	<!-- Home screen icon visibility (Discreet mode). Present on the analyzed target's own
+	     TrollStore build, which shows a non-injected app can mutate icon state. -->
+	<key>com.apple.springboard.iconState</key>
+	<true/>
+	<key>com.apple.springboard.iconState.mutate</key>
+	<true/>
+
+	<!-- Global hardware-key events (used by the daemon phase for true global triggers). -->
+	<key>com.apple.private.hid.client.event-monitor</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-dispatch</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-filter</key>
+	<true/>
+	<key>com.apple.private.hid.manager.client</key>
+	<true/>
+
 	<!-- Microphone without a prompt, and read/write access outside the container. -->
 	<key>com.apple.private.tcc.allow</key>
 	<array>
