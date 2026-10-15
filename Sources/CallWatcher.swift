@@ -104,13 +104,24 @@ public final class CallWatcher {
         return true
     }
 
-    fileprivate func dispatch(name: String, call: UnsafeMutableRawPointer?) {
-        let event = CallEvent(notification: name,
-                              state: getStatus.map { CallState(rawValue: $0(call)) ?? .unknown } ?? .unknown,
+    fileprivate func dispatch(name: CFNotificationName?, call: UnsafeMutableRawPointer?) {
+        // CTCallCopy* take an allocator as their first argument; NULL means "use the default".
+        func string(_ converter: CallCopyStringFn?) -> String? {
+            guard let converter, let call, let copied = converter(nil, call) else { return nil }
+            return copied as String
+        }
+
+        var state = CallState.unknown
+        if let getStatus, let call {
+            state = CallState(rawValue: getStatus(call)) ?? .unknown
+        }
+
+        let event = CallEvent(notification: name.map { $0.rawValue as String } ?? "",
+                              state: state,
                               activeCallCount: currentCallCount?() ?? 0,
-                              address: call.flatMap { copyAddress?($0).map { $0 as String } },
-                              displayName: call.flatMap { copyName?($0).map { $0 as String } },
-                              uniqueIdentifier: call.flatMap { copyUniqueID?($0).map { $0 as String } })
+                              address: string(copyAddress),
+                              displayName: string(copyName),
+                              uniqueIdentifier: string(copyUniqueID))
         onEvent?(event)
     }
 
@@ -130,6 +141,5 @@ public final class CallWatcher {
 private let CallWatcherCallback: CFNotificationCallback = { _, observer, name, object, _ in
     guard let observer else { return }
     let watcher = Unmanaged<CallWatcher>.fromOpaque(observer).takeUnretainedValue()
-    watcher.dispatch(name: (name as String?) ?? "",
-                     call: UnsafeMutableRawPointer(mutating: object))
+    watcher.dispatch(name: name, call: UnsafeMutableRawPointer(mutating: object))
 }
