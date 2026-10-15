@@ -132,10 +132,11 @@ final class AppModel: ObservableObject {
     private func startTicker() {
         ticker?.invalidate()
         ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let model = self else { return }
             Task { @MainActor in
-                guard let self, let running = self.recorder else { return }
-                self.elapsed = running.secondsRecorded
-                self.packets = running.packetsWritten
+                guard let running = model.recorder else { return }
+                model.elapsed = running.secondsRecorded
+                model.packets = running.packetsWritten
             }
         }
     }
@@ -169,7 +170,7 @@ final class AppModel: ObservableObject {
         let names: [CallState: String] = [.unknown: "未知", .answered: "已接通", .droppedInterrupted: "中断",
                                          .outgoingInitiated: "去电呼叫中", .incoming: "来电", .incomingEnded: "来电结束"]
         callStateText = names[event.state] ?? "状态 \(event.state.rawValue)"
-        if !event.address.isEmpty || event.displayName != nil {
+        if !(event.address ?? "").isEmpty || event.displayName != nil {
             appendLog("通话事件 \(callStateText) 号码=\(event.address ?? "-") 名称=\(event.displayName ?? "-")")
         }
         if event.state == .answered, recorder == nil {
@@ -186,6 +187,20 @@ final class AppModel: ObservableObject {
     }
 }
 
+/// Row layout that works on iOS 15 as well (LabeledContent is iOS 16+).
+struct InfoRow: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value).foregroundColor(.secondary)
+        }
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @State private var playing: URL?
@@ -196,11 +211,11 @@ struct ContentView: View {
         NavigationView {
             List {
                 Section(header: Text("状态")) {
-                    LabeledContent("通话", value: model.callStateText)
-                    LabeledContent("私有 tap", value: model.tapAvailability)
-                    LabeledContent("当前文件", value: model.currentFile)
-                    LabeledContent("时长", value: String(format: "%.1f 秒", model.elapsed))
-                    LabeledContent("音频包", value: "\(model.packets)")
+                    InfoRow(title: "通话", value: model.callStateText)
+                    InfoRow(title: "私有 tap", value: model.tapAvailability)
+                    InfoRow(title: "当前文件", value: model.currentFile)
+                    InfoRow(title: "时长", value: String(format: "%.1f 秒", model.elapsed))
+                    InfoRow(title: "音频包", value: "\(model.packets)")
                 }
 
                 Section(header: Text("录音")) {
