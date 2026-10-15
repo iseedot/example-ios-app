@@ -2,10 +2,9 @@
 //  AudioProcessProbe.swift
 //  MyCallRec — enumerate CoreAudio process objects to learn which process owns audio.
 //
-//  This uses the iOS 14+ "audio process object" API. Everything is resolved at
-//  runtime (function pointer plus four-character property selectors), so the app
-//  does not depend on those declarations being present in the SDK, and every call
-//  reports its OSStatus through the log.
+//  Uses the iOS 14+ audio process object API with caller-defined four-character
+//  selectors, so this compiles against any SDK that declares the basic HAL entry
+//  points while still reaching the per-process properties.
 //
 //  Why it matters:
 //    * it answers "which PID owns the call audio" without guessing;
@@ -15,10 +14,11 @@
 
 import Foundation
 import CoreFoundation
+import CoreAudio
 import Darwin
 
 struct AudioProcessInfo: Identifiable, Hashable {
-    let objectID: UInt32
+    let objectID: AudioObjectID
     let pid: Int32
     let bundleIdentifier: String?
     let isRunning: Bool
@@ -29,28 +29,15 @@ struct AudioProcessInfo: Identifiable, Hashable {
     var displayName: String { bundleIdentifier ?? "pid \(pid)" }
 }
 
-private struct AudioObjectPropertyAddress {
-    var mSelector: UInt32
-    var mScope: UInt32
-    var mElement: UInt32
-}
-
-private typealias AudioObjectGetPropertyDataFn = @convention(c) (UInt32,
-                                                                 UnsafePointer<AudioObjectPropertyAddress>,
-                                                                 UInt32,
-                                                                 UnsafeRawPointer?,
-                                                                 UnsafeMutablePointer<UInt32>,
-                                                                 UnsafeMutableRawPointer?) -> Int32
-
 enum AudioProcessProbe {
-    // Four-character property selectors. Values are the documented CoreAudio codes.
-    private static let fourCC: (String) -> UInt32 = { code in
-        code.unicodeScalars.reduce(UInt32(0)) { ($0 << 8) | UInt32($1.value & 0xFF) }
+    /// Four-character property selectors, built from their documented codes.
+    private static let fourCC: (String) -> AudioObjectPropertySelector = { code in
+        code.unicodeScalars.reduce(AudioObjectPropertySelector(0)) { ($0 << 8) | AudioObjectPropertySelector($1.value & 0xFF) }
     }
 
-    private static let scopeGlobal = fourCC("glob")
-    private static let elementMain: UInt32 = 0
-    private static let systemObject: UInt32 = 1
+    private static let systemObject = AudioObjectID(1)                  // kAudioObjectSystemObject
+    private static let scopeGlobal = fourCC("glob")                     // kAudioObjectPropertyScopeGlobal
+    private static let elementMain = AudioObjectPropertyElement(0)      // kAudioObjectPropertyElementMain
 
     private static let propertyProcessObjectList = fourCC("prco")
     private static let propertyProcessPID = fourCC("ppid")
@@ -59,79 +46,61 @@ enum AudioProcessProbe {
     private static let propertyProcessIsRunningInput = fourCC("piri")
     private static let propertyProcessIsRunningOutput = fourCC("piro")
 
-    private static let getPropertyData: AudioObjectGetPropertyDataFn? = {
-        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "AudioObjectGetPropertyData") else {
-            return nil
-        }
-        return unsafeBitCast(symbol, to: AudioObjectGetPropertyDataFn.self)
-    }()
+    static var isAvailable: Bool { true }
 
-    static var isAvailable: Bool { getPropertyData != nil }
-
-    /// Enumerates every CoreAudio process object. Errors are logged, not thrown.
+    /// Enumerates every CoreAudio process object. Failures are logged, not thrown.
     static func processes() -> [AudioProcessInfo] {
-        guard let getPropertyData else {
-            trlog(.warn, "AUDIO", "AudioObjectGetPropertyData 不可用，无法枚举音频进程")
-            return []
-        }
-
-        var size: UInt32 = 0
         var address = AudioObjectPropertyAddress(mSelector: propertyProcessObjectList,
                                                  mScope: scopeGlobal,
                                                  mElement: elementMain)
-        // First call only reports the required size, so the data pointer stays nil.
-        let probeStatus = getPropertyData(systemObject, &address, 0, nil, &size, nil)
-        var status = probeStatus
+        var size: UInt32 = 0
+        // The first call only reports the required size, so the data pointer stays nil.
+        var status = AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, nil)
         guard size > 0 else {
             trlog(.warn, "AUDIO", "音频进程列表为空 (status=\(status), size=\(size))")
             return []
         }
 
-        let count = Int(size) / MemoryLayout<UInt32>.size
-        var identifiers = [UInt32](repeating: 0, count: count)
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        var identifiers = [AudioObjectID](repeating: 0, count: count)
         status = identifiers.withUnsafeMutableBytes { raw in
-            getPropertyData(systemObject, &address, 0, nil, &size, raw.baseAddress!)
+            AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, raw.baseAddress)
         }
-        guard status == 0 else {
+        guard status == noErr else {
             trlog(.warn, "AUDIO", "读取音频进程列表失败 (status=\(status))")
             return []
         }
 
-        return identifiers.compactMap { info(for: $0, using: getPropertyData) }
+        return identifiers.compactMap { info(for: $0) }
     }
 
-    private static func info(for object: UInt32,
-                             using getPropertyData: AudioObjectGetPropertyDataFn) -> AudioProcessInfo? {
-        let pid = uint32Property(object, propertyProcessPID, using: getPropertyData).map { Int32(bitPattern: $0) } ?? -1
+    private static func info(for object: AudioObjectID) -> AudioProcessInfo? {
+        let pid = uint32Property(object, propertyProcessPID).map { Int32(bitPattern: $0) } ?? -1
         guard pid > 0 else { return nil }
         return AudioProcessInfo(objectID: object,
                                 pid: pid,
-                                bundleIdentifier: stringProperty(object, propertyProcessBundleID, using: getPropertyData),
-                                isRunning: uint32Property(object, propertyProcessIsRunning, using: getPropertyData) == 1,
-                                isRunningInput: uint32Property(object, propertyProcessIsRunningInput,
-                                                               using: getPropertyData) == 1,
-                                isRunningOutput: uint32Property(object, propertyProcessIsRunningOutput,
-                                                                using: getPropertyData) == 1)
+                                bundleIdentifier: stringProperty(object, propertyProcessBundleID),
+                                isRunning: uint32Property(object, propertyProcessIsRunning) == 1,
+                                isRunningInput: uint32Property(object, propertyProcessIsRunningInput) == 1,
+                                isRunningOutput: uint32Property(object, propertyProcessIsRunningOutput) == 1)
     }
 
-    private static func uint32Property(_ object: UInt32, _ selector: UInt32,
-                                       using getPropertyData: AudioObjectGetPropertyDataFn) -> UInt32? {
+    private static func uint32Property(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scopeGlobal, mElement: elementMain)
         var value: UInt32 = 0
         var size = UInt32(MemoryLayout<UInt32>.size)
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scopeGlobal, mElement: elementMain)
-        let status = getPropertyData(object, &address, 0, nil, &size, &value)
-        return status == 0 ? value : nil
+        let status = AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value)
+        return status == noErr ? value : nil
     }
 
-    private static func stringProperty(_ object: UInt32, _ selector: UInt32,
-                                       using getPropertyData: AudioObjectGetPropertyDataFn) -> String? {
+    private static func stringProperty(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scopeGlobal, mElement: elementMain)
         var pointer: Unmanaged<CFString>?
         var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scopeGlobal, mElement: elementMain)
-        let status = withUnsafeMutablePointer(to: &pointer) { buffer -> Int32 in
-            getPropertyData(object, &address, 0, nil, &size, UnsafeMutableRawPointer(buffer))
+        let status = withUnsafeMutablePointer(to: &pointer) { buffer in
+            AudioObjectGetPropertyData(object, &address, 0, nil, &size, buffer)
         }
-        guard status == 0, let value = pointer?.takeRetainedValue() else { return nil }
+        guard status == noErr, let value = pointer?.takeRetainedValue() else { return nil }
         return value as String
     }
 
