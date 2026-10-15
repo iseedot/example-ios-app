@@ -241,8 +241,9 @@ public final class TapRecorder {
 
     /// Samples the buffer to report a peak level; a cheap way to tell audio from silence.
     private func updatePeak(from buffer: AudioQueueBufferRef, byteCount: UInt32) {
-        guard byteCount >= 4, format.mBitsPerChannel == 32,
-              let data = buffer.pointee.mAudioData else { return }
+        guard byteCount >= 4, format.mBitsPerChannel == 32 else { return }
+        // mAudioData is imported as an implicitly unwrapped pointer, so it is used directly.
+        let data = buffer.pointee.mAudioData
         let sampleCount = Int(byteCount) / MemoryLayout<Float32>.size
         let samples = data.assumingMemoryBound(to: Float32.self)
         var peak: Float = 0
