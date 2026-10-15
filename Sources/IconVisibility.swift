@@ -70,7 +70,9 @@ enum IconVisibility {
 
         var attempts: [String] = []
         for name in machServiceCandidates {
-            let connection = NSXPCConnection(machServiceName: name, options: .privileged)
+            // The privileged NSXPCConnectionOptions initialiser is macOS-only; on iOS the
+            // mach service name alone is what matters.
+            let connection = NSXPCConnection(machServiceName: name)
             connection.resume()
             guard let service = initialize(allocated, NSSelectorFromString("initWithProcessHandle:"),
                                            connection as AnyObject) else {
