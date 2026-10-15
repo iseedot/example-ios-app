@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Minimal entitlement set for the Phase 1 PoC.
+  Derived from the analyzed target's own entitlements (see ../../analysis/entitlements.json);
+  the full list is reproduced there for reference. These are not obtainable with a normal
+  developer certificate: sign with ldid and install through TrollStore / a jailbreak.
+
+  Remove get-task-allow before any non-debugging install.
+-->
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>com.example.callrec</string>
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+
+	<!-- Tap / capture audio of the telephony stack and other processes. -->
+	<key>com.apple.coreaudio.CanTapTelephony</key>
+	<true/>
+	<key>com.apple.coreaudio.app-tap</key>
+	<true/>
+	<key>com.apple.coreaudio.private.SystemWideTap</key>
+	<true/>
+	<key>com.apple.coreaudio.CanRecordWithoutSessionActivation</key>
+	<true/>
+	<key>com.apple.private.coreaudio.mxsessionPropertyPipe</key>
+	<true/>
+	<key>com.apple.private.mediaexperience.startrecordinginthebackground.allow</key>
+	<true/>
+	<key>inter-app-audio</key>
+	<true/>
+
+	<!-- Telephone call state. -->
+	<key>com.apple.CommCenter.fine-grained</key>
+	<array>
+		<string>phone</string>
+		<string>identity</string>
+		<string>spi</string>
+	</array>
+	<key>com.apple.telephonyutilities.callservicesd</key>
+	<array>
+		<string>access-calls</string>
+		<string>modify-calls</string>
+	</array>
+
+	<!-- Microphone without a prompt, and read/write access outside the container. -->
+	<key>com.apple.private.tcc.allow</key>
+	<array>
+		<string>kTCCServiceMicrophone</string>
+	</array>
+	<key>com.apple.security.exception.files.absolute-path.read-write</key>
+	<array>
+		<string>/</string>
+	</array>
+	<key>user-preference-read</key>
+	<true/>
+	<key>user-preference-write</key>
+	<true/>
+</dict>
+</plist>

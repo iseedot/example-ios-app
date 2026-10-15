@@ -1,0 +1,48 @@
+name: build-tipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          swift --version
+
+      - name: Install ldid
+        run: brew install ldid || echo 'ldid install failed; build.sh falls back to codesign'
+
+      - name: Build tipa
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyCallRec-tipa
+          path: build/MyCallRec.tipa
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="tipa-${{ github.run_number }}"
+          gh release create "$tag" build/MyCallRec.tipa \
+            --title "MyCallRec tipa build #${{ github.run_number }}" \
+            --notes "TrollStore package (self-signed with private entitlements). Commit: ${{ github.sha }}"
+          echo "Release: https://github.com/${{ github.repository }}/releases/tag/$tag"
