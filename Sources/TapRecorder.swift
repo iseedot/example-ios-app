@@ -102,7 +102,7 @@ public final class TapRecorder {
         format.mSampleRate > 0 ? Double(packetsWritten) / format.mSampleRate : 0
     }
 
-    private static let callback: AudioQueueInputCallback = { userData, queue, buffer in
+    private static let callback: AudioQueueInputCallback = { userData, queue, buffer, _, _, _ in
         guard let userData else { return }
         let recorder = Unmanaged<TapRecorder>.fromOpaque(userData).takeUnretainedValue()
         recorder.handle(buffer: buffer, queue: queue)
@@ -137,7 +137,7 @@ public final class TapRecorder {
         if let imp = tr_implementation(of: descriptionClass, "initTapInternalWithFormat:PIDs:") {
             let initialize = unsafeBitCast(imp, to: InitTwoArgFn.self)
             description = initialize(allocated, NSSelectorFromString("initTapInternalWithFormat:PIDs:"),
-                                     format, [NSNumber(value: target.rawValue)])
+                                     format, [NSNumber(value: target.rawValue)] as NSArray)
         } else if let imp = tr_implementation(of: descriptionClass, "initProcessTapInternalWithFormat:PID:") {
             let initialize = unsafeBitCast(imp, to: InitTwoArgFn.self)
             description = initialize(allocated, NSSelectorFromString("initProcessTapInternalWithFormat:PID:"),
