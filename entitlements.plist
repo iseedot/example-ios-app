@@ -11,12 +11,10 @@
 <plist version="1.0">
 <dict>
 	<key>application-identifier</key>
-	<string>com.example.callrec</string>
+	<string>com.example.mycallrec</string>
 	<key>platform-application</key>
 	<true/>
 	<key>com.apple.private.security.no-sandbox</key>
-	<true/>
-	<key>get-task-allow</key>
 	<true/>
 
 	<!-- Tap / capture audio of the telephony stack and other processes. -->
