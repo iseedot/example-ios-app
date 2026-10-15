@@ -10,6 +10,10 @@
 import Foundation
 import Darwin
 
+// libproc's proc_pidpath is not exposed to Swift by the iOS SDK; bind it directly.
+@_silgen_name("proc_pidpath")
+private func tr_proc_pidpath(_ pid: Int32, _ buffer: UnsafeMutableRawPointer?, _ buffersize: UInt32) -> Int32
+
 struct ProcessEntry: Identifiable, Hashable {
     let pid: Int32
     let path: String
@@ -42,7 +46,9 @@ enum ProcessList {
         let pid = info.kp_proc.p_pid
         guard pid > 0 else { return nil }
         var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        let length = buffer.withUnsafeMutableBytes { raw -> Int32 in
+            tr_proc_pidpath(pid, raw.baseAddress, UInt32(raw.count))
+        }
         let path = length > 0 ? String(cString: buffer) : ""
         let name = path.isEmpty ? "pid \(pid)" : (path as NSString).lastPathComponent
         return ProcessEntry(pid: pid, path: path, name: name)
