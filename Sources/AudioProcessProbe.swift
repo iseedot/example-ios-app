@@ -45,7 +45,7 @@ enum AudioProcessProbe {
 
     /// Reported once per launch; the UI and the log both read it.
     private(set) static var statusDescription = "尚未探测"
-    private static var reportedFailure = false
+    private static var lastReport = ""
 
     /// Resolved on first use. No other static is touched from this initialiser: a
     /// static initialiser that writes another static is easy to get subtly wrong, so
@@ -139,15 +139,13 @@ enum AudioProcessProbe {
         return result
     }
 
-    /// Warns the first time, then drops to debug: the ticker calls this repeatedly and
-    /// a permanently unavailable API must not flood the log.
+    /// The ticker calls this every few seconds. A repeated identical failure is logged
+    /// once, not repeatedly, so it cannot bury the interesting lines; a *different*
+    /// failure is reported again.
     private static func report(_ message: String) {
-        if reportedFailure {
-            trlog(.debug, "AUDIO", message)
-        } else {
-            reportedFailure = true
-            trlog(.warn, "AUDIO", message)
-        }
+        guard message != lastReport else { return }
+        lastReport = message
+        trlog(.warn, "AUDIO", message)
     }
 
     private static func withAddress<T>(_ selector: UInt32, _ body: (UnsafeRawPointer) -> T) -> T {

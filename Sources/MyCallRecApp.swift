@@ -103,6 +103,8 @@ final class AppModel: ObservableObject {
     private var appIdleTicks = 0
     private var tickCount = 0
     private var lastLoggedSecond = -1
+    /// Process list as last written to the log, so an unchanged list is not repeated.
+    private var lastProcessSummary = ""
 
     init() {
         Log.shared.markSessionStart()
@@ -198,7 +200,12 @@ final class AppModel: ObservableObject {
         audioProcessStatus = AudioProcessProbe.statusDescription
         if !probed.isEmpty {
             audioProcesses = probed
-            trlog(.info, "AUDIO", "音频进程 \(probed.count) 个：\(AudioProcessProbe.describe(probed))")
+            // Only log when the list actually changes: this runs every few seconds.
+            let summary = AudioProcessProbe.describe(probed)
+            if summary != lastProcessSummary {
+                lastProcessSummary = summary
+                trlog(.info, "AUDIO", "音频进程 \(probed.count) 个：\(summary)")
+            }
             return
         }
         // Fallback: the HAL probe cannot enumerate here, so the sysctl listing still
@@ -208,7 +215,11 @@ final class AppModel: ObservableObject {
             AudioProcessInfo(objectID: 0, pid: $0.pid, bundleIdentifier: $0.name,
                              isRunning: true, isRunningInput: false, isRunningOutput: false)
         }
-        trlog(.debug, "AUDIO", "sysctl 候选 \(entries.count) 个：\(entries.map { "\($0.pid):\($0.name)" }.joined(separator: " "))")
+        let summary = entries.map { "\($0.pid):\($0.name)" }.joined(separator: " ")
+        if summary != lastProcessSummary {
+            lastProcessSummary = summary
+            trlog(.info, "AUDIO", "sysctl 候选 \(entries.count) 个：\(summary)")
+        }
     }
 
     /// pid of the first watched application that is running, or nil.

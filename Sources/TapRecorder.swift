@@ -107,6 +107,9 @@ public final class TapRecorder {
     private var file: AudioFileID?
     private var buffers: [AudioQueueBufferRef] = []
     private var format = AudioStreamBasicDescription()
+    /// The AVAudioFormat-derived description. Fully populated, unlike what the queue
+    /// may hand back, so it is what the file is created with.
+    private var requestedFormat = AudioStreamBasicDescription()
     private var packetIndex: Int64 = 0
     private let lock = NSLock()
     private var storedPackets: UInt64 = 0
@@ -160,6 +163,7 @@ public final class TapRecorder {
             throw TapRecorderError.formatRejected
         }
         self.format = requested.streamDescription.pointee
+        self.requestedFormat = Self.normalized(self.format)
         trlog(.info, "TAP", "请求格式：\(Self.describe(self.format))")
 
         guard let descriptionClass = NSClassFromString("ATAudioTapDescription"),
@@ -252,16 +256,47 @@ public final class TapRecorder {
             trlog(.warn, "TAP", "读不到队列的 StreamDescription，沿用请求格式")
         }
 
+        // Create the file from the fully populated request format, not from the queue's
+        // read-back. A partially filled ASBD makes AudioFileCreateWithURL fail with
+        // kAudioFileUnspecifiedError ('wht?'), which is exactly what the read-back
+        // produced. The read-back stays a diagnostic, and the packet maths below follow
+        // the format the file is actually written in.
+        var fileFormat = requestedFormat
+        let destinationDirectory = destination.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: destinationDirectory.path) {
+            try? FileManager.default.createDirectory(at: destinationDirectory,
+                                                     withIntermediateDirectories: true)
+            trlog(.warn, "TAP", "录音目录不存在，已创建：\(destinationDirectory.path)")
+        }
+        trlog(.info, "TAP", "写入目标：\(destination.path)")
+        trlog(.info, "TAP", "文件格式：\(Self.describe(fileFormat))")
+
         var file: AudioFileID?
-        status = AudioFileCreateWithURL(destination as CFURL, kAudioFileCAFType, &format,
+        status = AudioFileCreateWithURL(destination as CFURL, kAudioFileCAFType, &fileFormat,
                                         AudioFileFlags.eraseFile, &file)
+        if status != noErr {
+            trlog(.warn, "TAP", "用请求格式建文件失败：\(status) \(Self.fourCC(status))，改用显式 LPCM ASBD 重试")
+            var explicit = Self.explicitLinearPCM(sampleRate: fileFormat.mSampleRate,
+                                                  channels: fileFormat.mChannelsPerFrame)
+            status = AudioFileCreateWithURL(destination as CFURL, kAudioFileCAFType, &explicit,
+                                            AudioFileFlags.eraseFile, &file)
+            if status == noErr { fileFormat = explicit }
+        }
         guard status == noErr, let file else {
-            trlog(.error, "TAP", "AudioFileCreateWithURL 失败：\(status) \(Self.fourCC(status))")
+            trlog(.error, "TAP", "AudioFileCreateWithURL 失败：\(status) \(Self.fourCC(status))；"
+                  + "目录存在=\(FileManager.default.fileExists(atPath: destinationDirectory.path))；"
+                  + "格式=\(Self.describe(fileFormat))")
             AudioQueueDispose(queue, true)
             self.queue = nil
             throw TapRecorderError.fileCreationFailed(status)
         }
         self.file = file
+        format = fileFormat
+
+        if format.mBytesPerPacket != requestedFormat.mBytesPerPacket {
+            trlog(.warn, "TAP", "写入格式与请求格式的 bytes-per-packet 不同"
+                  + "（\(format.mBytesPerPacket) vs \(requestedFormat.mBytesPerPacket)），以写入格式为准")
+        }
 
         let bytesPerPacket = format.mBytesPerPacket != 0
             ? format.mBytesPerPacket
@@ -372,14 +407,53 @@ public final class TapRecorder {
         tap = nil
     }
 
-    /// Human-readable ASBD, so the log shows what the tap really produced.
+    /// Human-readable ASBD, so the log shows every field the file writer depends on.
     private static func describe(_ format: AudioStreamBasicDescription) -> String {
         let float = format.mFormatFlags & kAudioFormatFlagIsFloat != 0
         let interleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
-        return String(format: "%.0f Hz / %u ch / %u bit / %@ / %@ / %u bytes-per-packet",
+        return String(format: "id=%@ flags=0x%X %.0f Hz / %u ch / %u bit / %@ / %@ / pkt=%u bytes / frame=%u bytes / %u frames-per-packet",
+                      fourCCString(format.mFormatID), format.mFormatFlags,
                       format.mSampleRate, format.mChannelsPerFrame, format.mBitsPerChannel,
                       float ? "float" : "int", interleaved ? "interleaved" : "planar",
-                      format.mBytesPerPacket)
+                      format.mBytesPerPacket, format.mBytesPerFrame, format.mFramesPerPacket)
+    }
+
+    private static func fourCCString(_ value: UInt32) -> String {
+        let bytes = [UInt8((value >> 24) & 0xFF), UInt8((value >> 16) & 0xFF),
+                     UInt8((value >> 8) & 0xFF), UInt8(value & 0xFF)]
+        return String(bytes: bytes, encoding: .ascii) ?? "0x\(String(value, radix: 16))"
+    }
+
+    /// Fills in every derived field, so the result is always valid for a file writer.
+    private static func normalized(_ source: AudioStreamBasicDescription) -> AudioStreamBasicDescription {
+        var format = source
+        if format.mFormatID == 0 { format.mFormatID = kAudioFormatLinearPCM }
+        if format.mSampleRate == 0 { format.mSampleRate = 44100 }
+        if format.mChannelsPerFrame == 0 { format.mChannelsPerFrame = 2 }
+        if format.mBitsPerChannel == 0 { format.mBitsPerChannel = 32 }
+        if format.mFramesPerPacket == 0 { format.mFramesPerPacket = 1 }
+        if format.mBytesPerFrame == 0 {
+            format.mBytesPerFrame = max(1, format.mChannelsPerFrame * format.mBitsPerChannel / 8)
+        }
+        if format.mBytesPerPacket == 0 {
+            format.mBytesPerPacket = format.mBytesPerFrame * format.mFramesPerPacket
+        }
+        return format
+    }
+
+    /// Last-resort description: plain interleaved float32 PCM, which every writer accepts.
+    private static func explicitLinearPCM(sampleRate: Double, channels: UInt32) -> AudioStreamBasicDescription {
+        let channelCount = max(1, channels)
+        let bytesPerFrame = 4 * channelCount
+        return AudioStreamBasicDescription(mSampleRate: sampleRate > 0 ? sampleRate : 44100,
+                                           mFormatID: kAudioFormatLinearPCM,
+                                           mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+                                           mBytesPerPacket: bytesPerFrame,
+                                           mFramesPerPacket: 1,
+                                           mBytesPerFrame: bytesPerFrame,
+                                           mChannelsPerFrame: channelCount,
+                                           mBitsPerChannel: 32,
+                                           mReserved: 0)
     }
 
     deinit { stop() }
