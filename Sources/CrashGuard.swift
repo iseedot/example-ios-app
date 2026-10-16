@@ -32,10 +32,9 @@ private var trCrashDescriptor: Int32 = -1
 private let trCrashBanner = Array(
     "[MyCallRec] 致命信号：进程即将终止。上一次运行的日志尾部即为崩溃位置。\n".utf8)
 
-private func trCrashFileURL() -> URL? {
-    FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
-        .appendingPathComponent("logs", isDirectory: true)
-        .appendingPathComponent("crash.log")
+private func trCrashFileURL() -> URL {
+    // Same resolved directory as the run log: the container's Documents may be unusable.
+    Storage.logsDirectory.appendingPathComponent("crash.log")
 }
 
 private func trCrashAppend(_ text: String) {
@@ -82,7 +81,7 @@ enum CrashGuard {
             close(trCrashDescriptor)
             trCrashDescriptor = -1
         }
-        guard let url = trCrashFileURL() else { return }
+        let url = trCrashFileURL()
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: url.path) {
@@ -102,8 +101,8 @@ enum CrashGuard {
 
     /// Returns the previous crash text and clears the file, so it is reported once.
     static func consumePreviousCrash() -> String? {
-        guard let url = trCrashFileURL(),
-              let data = try? Data(contentsOf: url),
+        let url = trCrashFileURL()
+        guard let data = try? Data(contentsOf: url),
               !data.isEmpty,
               let text = String(data: data, encoding: .utf8) else { return nil }
         try? FileManager.default.removeItem(at: url)

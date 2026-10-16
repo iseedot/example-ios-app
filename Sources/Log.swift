@@ -64,35 +64,54 @@ final class Log {
         return [transcript()]
     }
 
-    var logDirectory: URL? {
-        guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        return documents.appendingPathComponent("logs", isDirectory: true)
-    }
+    /// Directory holding the run log, resolved to a path the process can really write.
+    var logDirectory: URL? { Storage.logsDirectory }
+
+    /// Why the log file could not be opened, for the startup log. A swallowed error here
+    /// is what hid the fact that nothing was ever written to disk.
+    private(set) var openError: String?
+    private var lastOpenAttempt: Date?
 
     func start() {
-        queue.async { self.openFile() }
+        // Resolve storage first: the container's Documents directory may be unusable.
+        Storage.resolve()
+        queue.sync { self.openFile() }
     }
 
     private func openFile() {
-        guard let directory = logDirectory else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Retry, but not on every single line when the failure is permanent.
+        if let lastOpenAttempt, handle == nil, Date().timeIntervalSince(lastOpenAttempt) < 3 { return }
+        lastOpenAttempt = Date()
+
+        let directory = Storage.logsDirectory
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            let error = error as NSError
+            openError = "建日志目录失败：\(error.domain) \(error.code) \(error.localizedDescription)"
+        }
+
         let url = directory.appendingPathComponent("MyCallRec.log")
-
-        if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-           let size = attributes[.size] as? Int, size > fileSizeLimit {
-            let rotated = directory.appendingPathComponent("MyCallRec.1.log")
-            try? FileManager.default.removeItem(at: rotated)
-            try? FileManager.default.moveItem(at: url, to: rotated)
-        }
-
-        if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
-        }
-        handle = try? FileHandle(forWritingTo: url)
-        handle?.seekToEndOfFile()
         fileURL = url
+        do {
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let size = attributes[.size] as? Int, size > fileSizeLimit {
+                let rotated = directory.appendingPathComponent("MyCallRec.1.log")
+                try? FileManager.default.removeItem(at: rotated)
+                try? FileManager.default.moveItem(at: url, to: rotated)
+            }
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            let opened = try FileHandle(forWritingTo: url)
+            try opened.seekToEndOfFile()
+            handle = opened
+            openError = nil
+        } catch {
+            let error = error as NSError
+            openError = "打开日志文件失败：\(error.domain) \(error.code) \(error.localizedDescription)（\(url.path)）"
+            handle = nil
+        }
     }
 
     /// Writes the file line before returning.

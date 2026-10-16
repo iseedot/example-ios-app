@@ -21,11 +21,18 @@ struct MyCallRecApp: App {
     @StateObject private var model = AppModel()
 
     init() {
-        // Crash handlers go in first: everything after this point is diagnosable from
-        // the log even if a private API raises an exception.
+        // Storage first: the container's Documents directory turned out to be unusable
+        // on this install, and the run log, the crash record and the recordings all
+        // depend on which directory is chosen.
+        Storage.resolve()
+        Log.shared.start()
+        // Mark the session before anything is logged, so the start-up lines below stay
+        // in this session instead of being wiped when the model is created.
+        Log.shared.markSessionStart()
+        // Crash handlers next: everything after this point is diagnosable even if a
+        // private API raises an exception.
         CrashGuard.install()
         AppModel.configureAudioSession()
-        Log.shared.start()
     }
 
     var body: some Scene {
@@ -79,7 +86,9 @@ final class AppModel: ObservableObject {
     /// so it is switchable: with the tap entitlements a session is not required.
     @Published var activatesAudioSession = true
     @Published var hideIcon = false
-    @Published var keySuppressesHUD = true
+    /// Off by default: the off-screen MPVolumeView that suppresses the HUD can take the
+    /// volume buttons over on some builds, which stops the trigger working at all.
+    @Published var keySuppressesHUD = false
     @Published var watchedBundleIDs = "com.tencent.xin"
 
     let library = RecordingLibrary()
@@ -107,12 +116,23 @@ final class AppModel: ObservableObject {
     private var lastProcessSummary = ""
 
     init() {
-        Log.shared.markSessionStart()
         Log.shared.onAppend = { [weak self] line in
             guard let self else { return }
             self.logLines.insert(line, at: 0)
             if self.logLines.count > 400 { self.logLines.removeLast(self.logLines.count - 400) }
         }
+        // Seed from the lines written before this model existed: storage resolution and
+        // the audio session are logged from the app's init.
+        logLines = Log.shared.lines
+
+        trlog(.info, "APP", "日志文件：\(Log.shared.logFileURL?.path ?? "不可用")")
+        if let openError = Log.shared.openError {
+            trlog(.error, "APP", "日志文件不可写：\(openError)")
+        }
+        for line in Storage.resolutionLog {
+            trlog(.info, "APP", "存储：\(line)")
+        }
+        trlog(.info, "APP", "录音目录：\(Storage.recordingsDirectory.path)")
 
         // A previous run that died leaves its reason on disk; surface it as the first
         // lines of this session so "复制全部日志" carries it without the Files app.
@@ -637,6 +657,8 @@ struct ContentView: View {
                     Toggle("音量键触发", isOn: Binding(get: { model.watchVolumeKeys },
                                                      set: { _ in model.toggleWatchVolumeKeys() }))
                     Toggle("按键不显示音量 HUD", isOn: $model.keySuppressesHUD)
+                    Text("打开后会插入一个屏幕外的音量控件来压掉系统音量提示。若打开后音量键失去反应，请关掉它——那个控件会接管音量键。")
+                        .font(.caption2).foregroundColor(.secondary)
                     Toggle("激活音频会话", isOn: Binding(get: { model.activatesAudioSession },
                                                       set: { newValue in
                                                           model.activatesAudioSession = newValue

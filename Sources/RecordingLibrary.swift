@@ -21,10 +21,15 @@ final class RecordingLibrary: ObservableObject {
     let directory: URL
 
     init() {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        directory = documents.appendingPathComponent("Recordings", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Storage.resolve() has already picked a directory that accepts writes; the
+        // container's Documents directory does not on this install.
+        directory = Storage.recordingsDirectory
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            let error = error as NSError
+            trlog(.error, "APP", "建录音目录失败：\(error.domain) \(error.code) \(error.localizedDescription)（\(directory.path)）")
+        }
         refresh()
     }
 
