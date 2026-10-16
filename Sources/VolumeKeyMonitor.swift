@@ -1,23 +1,22 @@
 //
 //  VolumeKeyMonitor.swift
-//  MyCallRec — trigger recording from the hardware volume buttons.
+//  MyCallRec — the volume-delta fallback for the hardware-key trigger.
 //
-//  The first implementation observed AVAudioSession.outputVolume with KVO. On this
-//  device that never delivered a single callback, so the presses are now *sampled*:
-//  a 0.1 s timer reads the volume and turns a change into a press. Two sources are
-//  read at once, because they fail independently:
+//  This is the fallback path, not the primary one. HIDKeyMonitor receives the real button
+//  transitions; this sampler only reads AVAudioSession.outputVolume (and the hidden
+//  MPVolumeView's slider when HUD suppression is on) every 0.1 s and turns a change into a
+//  press. It stays because it works without any private HID facility, but it is inherently
+//  lossy: pressing both buttons together cancels the volume change out, and a press at
+//  either volume bound changes nothing at all.
 //
-//    * AVAudioSession.outputVolume — always available
-//    * the hidden MPVolumeView's slider — only when HUD suppression is on, and it is
-//      the value the hardware buttons drive once such a view exists
+//  To keep the two sources from double-reporting, emitPress is suppressed once
+//  HIDKeyMonitor has decoded a real volume event (see hidIsPrimary). That is also what
+//  stops the volume restore from looking like the second half of a combo.
 //
-//  A press that changes the volume by more than one step counts as that many presses,
-//  so two quick presses inside one sample are not lost.
-//
-//  HUD suppression installs an off-screen MPVolumeView. On some builds that view takes
-//  the volume buttons over, which is why it is now off by default: get the trigger
-//  working first, then suppress the HUD. Intercepting the buttons while the app is
-//  suspended or killed needs the daemon phase.
+//  HUD suppression installs an off-screen MPVolumeView. On some builds that view takes the
+//  volume buttons over, which is why it is off by default: get the trigger working first,
+//  then suppress the HUD. Intercepting the buttons while the app is suspended or killed
+//  needs the daemon phase.
 //
 
 import Foundation
@@ -27,27 +26,17 @@ import UIKit
 import AudioToolbox
 
 final class VolumeKeyMonitor {
-    /// Shortest and longest gap between the two directions of a combo.
-    private let comboWindow: TimeInterval = 0.6
-    private let doublePressWindow: TimeInterval = 0.9
-    /// How often the volume is read. Coarser than a press, finer than a double press.
+    /// How often the volume is read. Coarser than a press.
     private let sampleInterval: TimeInterval = 0.1
-    /// One iOS volume step, so a multi-step change can be counted as several presses.
-    private let volumeStep: Float = 1.0 / 16.0
-    /// The two sources report the same press; the echo arrives within this window.
-    private let echoWindow: TimeInterval = 0.12
 
-    private enum Press { case up, down }
-
-    /// Called when a combo fires; the string describes what was detected.
-    var onCombo: ((String) -> Void)?
-    /// Called for every individual press, for logging and diagnostics.
-    var onPress: ((String) -> Void)?
+    /// Shared detector. Every press is handed to it; nothing is classified here.
+    private let detector: KeyComboDetector
+    /// When this returns true the delta sampler stays quiet: the HID path has real events,
+    /// so the derived presses would only duplicate them.
+    var hidIsPrimary: (() -> Bool)?
 
     private var timer: Timer?
     private var volumeView: MPVolumeView?
-    private var recent: [(press: Press, at: Date)] = []
-    private var lastPress: (press: Press, at: Date)?
 
     private var suppressVolumeHUD = true
     private var restoreVolume = true
@@ -62,6 +51,10 @@ final class VolumeKeyMonitor {
     private var warnedAboutBound = false
 
     static var isSupported: Bool { true }
+
+    init(detector: KeyComboDetector) {
+        self.detector = detector
+    }
 
     func start(suppressHUD: Bool = true, restoreVolume: Bool = true) {
         guard !active else { return }
@@ -86,14 +79,14 @@ final class VolumeKeyMonitor {
         self.timer = timer
 
         let sliderText = volumeSlider.map { String(format: "%.3f", $0.value) } ?? "无（HUD 抑制关闭）"
-        trlog(.info, "KEY", "音量键监听已启动（采样 \(Int(sampleInterval * 1000)) ms，HUD 抑制=\(suppressVolumeHUD)，"
+        trlog(.info, "KEY", "音量键采样后备已启动（采样 \(Int(sampleInterval * 1000)) ms，HUD 抑制=\(suppressVolumeHUD)，"
               + "音量还原=\(restoreVolume)，会话音量 \(String(format: "%.3f", session.outputVolume))，slider \(sliderText)）")
 
         if baseline <= 0.005 {
             trlog(.warn, "KEY", "当前音量为 0：此时「音量-」不会产生变化事件（已在下界），"
-                  + "请用「音量+」双击，或先把音量调到中间再试")
+                  + "请用「音量+」或组合键")
         } else if baseline >= 0.995 {
-            trlog(.warn, "KEY", "当前音量已到最大：「音量+」不会产生变化事件，请用「音量-」双击")
+            trlog(.warn, "KEY", "当前音量已到最大：「音量+」不会产生变化事件，请用「音量-」或组合键")
         }
     }
 
@@ -103,7 +96,7 @@ final class VolumeKeyMonitor {
         volumeView?.removeFromSuperview()
         volumeView = nil
         active = false
-        trlog(.info, "KEY", "音量键监听已停止")
+        trlog(.info, "KEY", "音量键采样后备已停止")
     }
 
     /// Called from the view when it appears: by then a key window exists.
@@ -175,39 +168,10 @@ final class VolumeKeyMonitor {
     }
 
     private func emitPress(from delta: Float, source: String) {
-        let steps = min(4, max(1, Int((abs(delta) / volumeStep).rounded())))
-        let press: Press = delta > 0 ? .up : .down
-        for _ in 0..<steps {
-            handle(press: press, source: source)
-        }
-    }
-
-    private func handle(press: Press, source: String) {
-        let now = Date()
-
-        // Both sources report one press; ignore the second report of the same direction.
-        if let last = lastPress, last.press == press, now.timeIntervalSince(last.at) < echoWindow {
-            return
-        }
-        lastPress = (press, now)
-
-        onPress?(press == .up ? "音量+" : "音量-")
-        recent.append((press, now))
-        recent.removeAll { now.timeIntervalSince($0.at) > doublePressWindow }
-
-        let ups = recent.filter { $0.press == .up }
-        let downs = recent.filter { $0.press == .down }
-
-        var description: String?
-        if !ups.isEmpty, !downs.isEmpty,
-           let first = recent.first, let last = recent.last,
-           abs(last.at.timeIntervalSince(first.at)) <= comboWindow {
-            description = "音量+ 与 音量- 组合"
-        } else if downs.count >= 2 {
-            description = "音量- 双击"
-        } else if ups.count >= 2 {
-            description = "音量+ 双击"
-        }
+        // Once the HID path has real events, a derived press would only be a duplicate or a
+        // volume-restore artefact.
+        if hidIsPrimary?() == true { return }
+        detector.press(delta > 0 ? .up : .down, source: source)
 
         // Put the volume back so the combo does not change it, and keep the samplers in
         // step with the restored value so the restore is not read as another press.
@@ -220,19 +184,10 @@ final class VolumeKeyMonitor {
         } else {
             baseline = AVAudioSession.sharedInstance().outputVolume
             lastSessionVolume = baseline
-            if !warnedAboutBound, suppressVolumeHUD == false {
+            if !warnedAboutBound, !suppressVolumeHUD {
                 warnedAboutBound = true
                 trlog(.info, "KEY", "音量 HUD 抑制关闭时无法还原音量：每次按键会让音量变化一格")
             }
-        }
-
-        if let description {
-            recent.removeAll()
-            trlog(.info, "KEY", "触发按键组合：\(description)（来源 \(source)）")
-            onCombo?(description)
-        } else {
-            trlog(.info, "KEY", "按键：\(press == .up ? "音量+" : "音量-")（等待组合；来源 \(source)，"
-                  + "当前音量 \(String(format: "%.3f", AVAudioSession.sharedInstance().outputVolume))）")
         }
     }
 

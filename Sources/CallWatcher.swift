@@ -48,6 +48,19 @@ public struct CallEvent {
     public let address: String?
     public let displayName: String?
     public let uniqueIdentifier: String?
+    /// Friendly call type (normal / VoIP / …) when CTCallGetCallType is available.
+    public let callType: String?
+    /// Direction, when CTCallIsOutgoing is available.
+    public let isOutgoing: Bool?
+}
+
+/// Call identity kept with a recording, so the library can show who a file belongs to.
+public struct CallInfo: Codable, Hashable {
+    public let address: String?
+    public let name: String?
+    public let type: String?
+    public let outgoing: Bool?
+    public let state: String
 }
 
 private typealias TelephonyCenterGetDefaultFn = @convention(c) () -> CFNotificationCenter?
@@ -59,6 +72,8 @@ private typealias TelephonyCenterRemoveObserverFn = @convention(c) (CFNotificati
                                                                    CFString?, UnsafeRawPointer?) -> Void
 private typealias CallGetStatusFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
 private typealias CallCopyStringFn = @convention(c) (CFAllocator?, UnsafeMutableRawPointer?) -> CFString?
+private typealias CallGetTypeFn = @convention(c) (UnsafeMutableRawPointer?) -> CFString?
+private typealias CallIsOutgoingFn = @convention(c) (UnsafeMutableRawPointer?) -> UInt8
 private typealias CurrentCallCountFn = @convention(c) () -> Int32
 
 public final class CallWatcher {
@@ -81,6 +96,10 @@ public final class CallWatcher {
     private var copyName: CallCopyStringFn?
     private var copyUniqueID: CallCopyStringFn?
     private var currentCallCount: CurrentCallCountFn?
+    private var getCallType: CallGetTypeFn?
+    private var isOutgoing: CallIsOutgoingFn?
+    /// Raw CTCallType value -> readable label, resolved from the framework globals.
+    private var callTypeLabels: [String: String] = [:]
     private var onEvent: ((CallEvent) -> Void)?
 
     /// Human-readable resolution outcome, shown in the UI so a failing device needs no debugger.
@@ -170,6 +189,18 @@ public final class CallWatcher {
         copyName = symbol("CTCallCopyName", as: CallCopyStringFn.self, in: handle)
         copyUniqueID = symbol("CTCallCopyUniqueStringID", as: CallCopyStringFn.self, in: handle)
         currentCallCount = symbol("CTGetCurrentCallCount", as: CurrentCallCountFn.self, in: handle)
+        getCallType = symbol("CTCallGetCallType", as: CallGetTypeFn.self, in: handle)
+        isOutgoing = symbol("CTCallIsOutgoing", as: CallIsOutgoingFn.self, in: handle)
+
+        callTypeLabels.removeAll()
+        for (name, label) in [("kCTCallTypeNormal", "普通电话"),
+                              ("kCTCallTypeVOIP", "网络电话"),
+                              ("kCTCallTypeVideoConference", "视频通话"),
+                              ("kCTCallTypeVoicemail", "语音信箱")] {
+            guard let pointer = Self.lookup(name, in: handle),
+                  let value = pointer.assumingMemoryBound(to: CFString?.self).pointee else { continue }
+            callTypeLabels[value as String] = label
+        }
 
         guard let statusPointer = Self.lookup("kCTCallStatusChangeNotification", in: handle) else {
             statusDetail = "\(opened.detail)；缺少 kCTCallStatusChangeNotification"
@@ -221,13 +252,16 @@ public final class CallWatcher {
         }
 
         let onlyCall = (dictionary?["kCTCallIsTheOnlyCall"] as? Bool) ?? true
+        let rawType = (call.flatMap { getCallType?($0) }).map { $0 as String }
         let event = CallEvent(notification: name.map { $0.rawValue as String } ?? "",
                               state: state,
                               activeCallCount: currentCallCount?() ?? 0,
                               onlyCall: onlyCall,
                               address: string(copyAddress),
                               displayName: string(copyName),
-                              uniqueIdentifier: string(copyUniqueID))
+                              uniqueIdentifier: string(copyUniqueID),
+                              callType: rawType.map { callTypeLabels[$0] ?? $0 },
+                              isOutgoing: call.flatMap { isOutgoing?($0) }.map { $0 != 0 })
         onEvent?(event)
     }
 

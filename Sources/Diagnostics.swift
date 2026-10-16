@@ -173,6 +173,10 @@ enum Diagnostics {
 
         payload["entitlements"] = entitlementReport()
         payload["tapCapability"] = tapCapability()
+        payload["keyEvents"] = [
+            "hidSupported": "\(HIDKeyMonitor.isSupported)",
+            "entitlement": "com.apple.private.hid.client.event-monitor",
+        ]
 
         let probe = CallWatcher.probe()
         payload["coreTelephony"] = ["available": "\(probe.available)", "detail": probe.detail]
@@ -215,6 +219,8 @@ enum Diagnostics {
         }
         section("私有 tap")
         for (key, value) in (payload["tapCapability"] as? [String: String]) ?? [:] { lines.append("\(key): \(value)") }
+        section("按键事件源")
+        lines.append("IOHID 可用: \(HIDKeyMonitor.isSupported)（真实按键事件优先，音量采样作后备）")
         section("CoreTelephony")
         lines.append("available: \(probe.available)")
         lines.append("detail: \(probe.detail)")

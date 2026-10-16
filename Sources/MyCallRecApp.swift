@@ -10,6 +10,10 @@
 //
 //  The recorder runs while any source is active and stops when the last one ends.
 //
+//  Target selection is automatic by default: a call is recorded from the call audio
+//  (the tapped app for a VoIP call, the system mix for a telephony call) and everything
+//  else from the microphone. A manual target overrides that only while no call is up.
+//
 
 import SwiftUI
 import UIKit
@@ -44,6 +48,9 @@ struct MyCallRecApp: App {
 }
 
 enum TargetChoice: String, CaseIterable, Identifiable {
+    /// The default. Pick the source from what is going on: a call is recorded from the
+    /// call audio, everything else from the microphone. No manual choice to keep in sync.
+    case auto = "自动（通话→通话音频 / 空闲→麦克风）"
     case microphone = "麦克风"
     case systemAudio = "系统音频"
     case speaker = "扬声器"
@@ -70,7 +77,7 @@ final class AppModel: ObservableObject {
     @Published var peak: Float = 0
     @Published var maxPeak: Float = 0
 
-    @Published var targetChoice: TargetChoice = .systemAudio
+    @Published var targetChoice: TargetChoice = .auto
     @Published var customPID: String = ""
     @Published var callStateText: String = "无"
     @Published var coreTelephonyStatus: String = "未检测"
@@ -78,6 +85,7 @@ final class AppModel: ObservableObject {
     @Published var audioProcessStatus: String = "未检测"
     @Published var appAudioStatus: String = "未安装"
     @Published var audioProcesses: [AudioProcessInfo] = []
+    @Published var keyStatus: String = "未启用"
 
     @Published var watchCalls = true
     @Published var watchApps = true
@@ -85,7 +93,13 @@ final class AppModel: ObservableObject {
     /// Activating a play-and-record session can disturb the app whose audio we tap,
     /// so it is switchable: with the tap entitlements a session is not required.
     @Published var activatesAudioSession = true
+    /// Keeps a silent audio session busy so the app is not suspended while another app is
+    /// in the foreground. Without it the triggers cannot fire in the background at all.
+    @Published var keepAliveInBackground = true
     @Published var hideIcon = false
+    /// On by default: the real HID key events. Off is the escape hatch if a build's
+    /// private event system misbehaves; the volume sampler still works without it.
+    @Published var useHIDKeyEvents = true
     /// Off by default: the off-screen MPVolumeView that suppresses the HUD can take the
     /// volume buttons over on some builds, which stops the trigger working at all.
     @Published var keySuppressesHUD = false
@@ -95,8 +109,12 @@ final class AppModel: ObservableObject {
 
     private var recorder: TapRecorder?
     private var watcher: CallWatcher?
-    private var keyMonitor: VolumeKeyMonitor?
     private var audioUseWatcher: AudioUseWatcher?
+    /// The shared gesture state machine, fed by both key-event sources.
+    private let keyDetector = KeyComboDetector()
+    private var hidMonitor: HIDKeyMonitor?
+    private var volumeMonitor: VolumeKeyMonitor?
+    private var keepAlive: BackgroundKeepAlive?
     private var ticker: Timer?
     /// Guards `startEnabledTriggers`: the view calls it on every appearance.
     private var triggersStarted = false
@@ -106,6 +124,22 @@ final class AppModel: ObservableObject {
     private var callWants = false
     private var appWants = false
     private var appWantedPID: Int32?
+    /// Set while a non-telephony (CallKit / VoIP) call is up, so the default target knows
+    /// to take the call audio rather than the microphone.
+    private var voipCallActive = false
+    /// The audio-use signals currently accepted, so one ending does not clear the source
+    /// while another (e.g. CallKit) is still up.
+    private var activeAudioUseSignals: Set<String> = []
+    /// How the current manual recording started, for the log and the metadata sidecar.
+    private var manualTrigger: RecordTrigger = .manual
+    /// Set once the source has changed mid-recording, to avoid restart loops.
+    private var recordingTargetSnapshot: TapTarget?
+    /// The trigger that started the current recording, for the log and the sidecar.
+    private var runningTriggerSnapshot: RecordTrigger = .manual
+    /// Call metadata captured with the recording, written to the sidecar on stop.
+    private var activeCallInfo: CallInfo?
+    /// Most recent call event, so a recording started later still carries the call it is for.
+    private var latestCall: CallInfo?
     /// Set when the volume key stopped a recording: auto sources stay muted
     /// until they have all gone inactive once.
     private var autoMutedUntilSourcesEnd = false
@@ -170,7 +204,7 @@ final class AppModel: ObservableObject {
     /// view calls this from `onAppear` rather than from `init`.
     func startEnabledTriggers() {
         guard !triggersStarted else {
-            keyMonitor?.retryVolumeViewIfNeeded()
+            volumeMonitor?.retryVolumeViewIfNeeded()
             return
         }
         triggersStarted = true
@@ -179,6 +213,7 @@ final class AppModel: ObservableObject {
         if watchCalls { startCallWatcher() }
         if watchApps { startAudioUseWatcher() }
         if watchVolumeKeys { installKeyMonitor() }
+        updateKeepAlive()
     }
 
     static func configureAudioSession(activate: Bool = true) {
@@ -252,8 +287,10 @@ final class AppModel: ObservableObject {
 
     // MARK: - Recording control
 
-    var resolvedTarget: TapTarget? {
+    /// The manually chosen target, or nil when the choice is "automatic".
+    var manualTarget: TapTarget? {
         switch targetChoice {
+        case .auto: return nil
         case .microphone: return .microphone
         case .systemAudio: return .systemAudio
         case .speaker: return .speaker
@@ -266,6 +303,30 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// True while any kind of call is up: a telephony call seen by CoreTelephony, or a
+    /// CallKit/VoIP call seen by AudioUseWatcher (WeChat and friends).
+    var callActive: Bool { callWants || voipCallActive }
+
+    /// The target the next recording should use. This is the default rule the app is
+    /// meant to follow:
+    ///   * a call is up          -> the call audio (the tapped app for a VoIP call, the
+    ///                              system mix for a telephony call)
+    ///   * no call               -> the microphone
+    /// A manual choice (targetChoice != .auto) only applies when no call is up, so
+    /// "automatic" behaves the way a call recorder is expected to.
+    func effectiveTarget() -> TapTarget {
+        if appWants {
+            // A watched app is up: tap its own audio, which is where the call audio lives.
+            if let pid = appWantedPID { return .process(pid) }
+            // The signal came from somewhere we could not resolve; the system mix is a
+            // better guess than the microphone.
+            return .systemAudio
+        }
+        if callActive { return .systemAudio }
+        if let manual = manualTarget { return manual }
+        return .microphone
+    }
+
     private func startRecording(prefix: String, target: TapTarget, trigger: RecordTrigger) {
         guard recorder == nil else {
             trlog(.info, "REC", "已在录音中，忽略来自「\(trigger.rawValue)」的启动请求")
@@ -273,7 +334,11 @@ final class AppModel: ObservableObject {
         }
         let url = library.newRecordingURL(prefix: prefix)
         do {
-            let created = try TapRecorder(target: target, sampleRate: 44100, channels: 2, fileURL: url)
+            // The microphone sentinel is mono upstream (cli/call-recorder.mm); the call and
+            // system taps are stereo. Asking for stereo from the microphone tap can come
+            // back empty on some builds.
+            let channels: UInt32 = target == .microphone ? 1 : 2
+            let created = try TapRecorder(target: target, sampleRate: 44100, channels: channels, fileURL: url)
             try created.start()
             recorder = created
             isRecording = true
@@ -283,7 +348,10 @@ final class AppModel: ObservableObject {
             maxPeak = 0
             lastLoggedSecond = -1
             currentFile = url.lastPathComponent
-            trlog(.info, "REC", "开始录音（\(trigger.rawValue)）target=\(target.label)")
+            recordingTargetSnapshot = target
+            runningTriggerSnapshot = trigger
+            activeCallInfo = latestCall
+            trlog(.info, "REC", "开始录音（\(trigger.rawValue)）target=\(target.label) 声道=\(channels)")
             trlog(.info, "REC", "文件：\(url.path)")
         } catch {
             trlog(.error, "REC", "开始录音失败（\(trigger.rawValue)）：\(error)")
@@ -304,9 +372,24 @@ final class AppModel: ObservableObject {
         } else if running.maxPeakAmplitude < 0.0005 {
             trlog(.warn, "REC", "全程近乎静音（峰值 \(running.maxPeakAmplitude)）：tap 目标可能不对")
         }
+        // A sidecar next to the audio file records what produced it: the trigger, the tap
+        // target, the call, and the measured quality. The analysed target keeps a manifest
+        // for the same reason; this is the small version.
+        let meta = RecordingMeta(trigger: runningTriggerSnapshot.rawValue,
+                                 target: recordingTargetSnapshot?.label ?? running.targetLabel,
+                                 call: activeCallInfo,
+                                 startedAt: running.startedAt,
+                                 seconds: running.secondsRecorded,
+                                 packets: running.packetsWritten,
+                                 peak: running.maxPeakAmplitude,
+                                 silent: running.maxPeakAmplitude < 0.0005)
+        library.writeMeta(meta, for: running.fileURL)
         recorder = nil
         isRecording = false
         currentFile = "-"
+        recordingTargetSnapshot = nil
+        runningTriggerSnapshot = .manual
+        activeCallInfo = nil
         library.refresh()
     }
 
@@ -317,15 +400,20 @@ final class AppModel: ObservableObject {
             wants = false
         }
 
+        let target = effectiveTarget()
+
+        // A call can begin or end while a recording is already running. The tap target
+        // cannot change under a live queue, so the only correct move is to close the file
+        // and start a new one on the new target.
+        if wants, recorder != nil, let snapshot = recordingTargetSnapshot, snapshot != target {
+            trlog(.info, "REC", "录音目标变化 \(snapshot.label) -> \(target.label)，重开文件")
+            stopRecording(reason: "目标变化")
+        }
+
         if wants, recorder == nil {
-            let target: TapTarget
-            if appWants, let pid = appWantedPID {
-                target = .process(pid)
-            } else {
-                target = resolvedTarget ?? .systemAudio
-            }
-            let trigger: RecordTrigger = appWants ? .app : (callWants ? .call : .manual)
-            let prefix = appWants ? "app" : (callWants ? "call" : "rec")
+            let trigger = intendedTrigger()
+            let prefix = trigger == .app ? "app"
+                : (trigger == .call ? "call" : (trigger == .volumeKey ? "key" : "rec"))
             startRecording(prefix: prefix, target: target, trigger: trigger)
         } else if !wants, recorder != nil {
             stopRecording(reason: "来源全部结束")
@@ -336,6 +424,13 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// The trigger that best describes why a recording is wanted right now.
+    private func intendedTrigger() -> RecordTrigger {
+        if appWants { return .app }
+        if callActive { return .call }
+        return manualTrigger
+    }
+
     // MARK: - Triggers
 
     func toggleManualRecording() {
@@ -344,8 +439,9 @@ final class AppModel: ObservableObject {
             trlog(.info, "REC", "手动停止")
         } else {
             manualWants = true
+            manualTrigger = .manual
             autoMutedUntilSourcesEnd = false
-            trlog(.info, "REC", "手动开始")
+            trlog(.info, "REC", "手动开始（目标 \(effectiveTarget().label)）")
         }
         reevaluate()
     }
@@ -361,6 +457,7 @@ final class AppModel: ObservableObject {
             trlog(.info, "CT", "已停止通话监听")
             reevaluate()
         }
+        updateKeepAlive()
     }
 
     private func startCallWatcher() {
@@ -389,9 +486,12 @@ final class AppModel: ObservableObject {
             audioUseWatcher = nil
             appWants = false
             appWantedPID = nil
+            activeAudioUseSignals.removeAll()
+            voipCallActive = false
             appAudioStatus = "已关闭"
             reevaluate()
         }
+        updateKeepAlive()
     }
 
     /// Subscribes to the audio-session and CallKit signals that a non-telephony call
@@ -417,28 +517,44 @@ final class AppModel: ObservableObject {
 
     /// One audio-signal event. The signal only says "another app is using audio now";
     /// the tap target and the per-recording evidence are reported by the recorder.
+    ///
+    /// CallKit is authoritative for a VoIP call. The interruption and secondary-audio
+    /// signals are generic, so they only start a recording when a watched app can actually
+    /// be resolved — otherwise any app that plays a video would start one.
     private func handleAudioUse(_ event: AudioUseEvent) {
         switch event {
         case .started(let kind, let detail):
             trlog(.info, "APP", "\(kind.rawValue)：开始（\(detail)）")
             guard watchApps else { return }
-            let pid = watchedAppPID()
             appIdleTicks = 0
             autoMutedUntilSourcesEnd = false
-            if !appWants {
-                appWants = true
-                appWantedPID = pid
-                trlog(.info, "APP", "应用音频触发录音；目标 \(pid.map { "pid \($0)" } ?? "未匹配到监听的 App，回退到当前目标")")
-                reevaluate()
-            } else if let pid, pid != appWantedPID {
-                trlog(.info, "APP", "应用音频目标 PID 变化 \(appWantedPID ?? -1) -> \(pid)")
-                if recorder != nil { stopRecording(reason: "目标进程变化") }
-                appWantedPID = pid
-                reevaluate()
+            if kind == .callKit { voipCallActive = true }
+
+            guard let pid = watchedAppPID() else {
+                if kind == .callKit {
+                    activeAudioUseSignals.insert(kind.rawValue)
+                    appWants = true
+                    appWantedPID = nil
+                    trlog(.info, "APP", "CallKit 通话接通，但未匹配到监听的 App：回退到系统音频")
+                    reevaluate()
+                } else {
+                    trlog(.info, "APP", "\(kind.rawValue) 来自未监听的 App，且未匹配到 Bundle ID，忽略")
+                }
+                return
             }
+
+            activeAudioUseSignals.insert(kind.rawValue)
+            if appWants, appWantedPID == pid { return }
+            if recorder != nil, appWantedPID != pid { stopRecording(reason: "目标进程变化") }
+            appWants = true
+            appWantedPID = pid
+            trlog(.info, "APP", "应用音频触发录音；目标 pid \(pid)")
+            reevaluate()
         case .ended(let kind, let detail):
             trlog(.info, "APP", "\(kind.rawValue)：结束（\(detail)）")
-            guard appWants else { return }
+            activeAudioUseSignals.remove(kind.rawValue)
+            if kind == .callKit { voipCallActive = false }
+            guard appWants, activeAudioUseSignals.isEmpty else { reevaluate(); return }
             appWants = false
             appWantedPID = nil
             appIdleTicks = 0
@@ -465,24 +581,86 @@ final class AppModel: ObservableObject {
         if watchVolumeKeys {
             installKeyMonitor()
         } else {
-            keyMonitor?.stop()
-            keyMonitor = nil
-            trlog(.info, "KEY", "音量键监听已停止")
+            stopKeyMonitor()
+        }
+        updateKeepAlive()
+    }
+
+    /// Builds the key-event path: the shared detector plus, when it exists, the real HID
+    /// source, and the volume-delta fallback behind it.
+    private func installKeyMonitor() {
+        if let volumeMonitor {
+            volumeMonitor.retryVolumeViewIfNeeded()
+            return
+        }
+
+        let detector = keyDetector
+        detector.reset()
+        detector.onPress = { name in trlog(.info, "KEY", "按键事件：\(name)") }
+        detector.onCombo = { [weak self] description in
+            Task { @MainActor in self?.handleVolumeCombo(description) }
+        }
+
+        // Primary source: the real button transitions. Its presses are deduplicated
+        // against the fallback by the shared detector.
+        var hid: HIDKeyMonitor?
+        if useHIDKeyEvents {
+            let candidate = HIDKeyMonitor()
+            candidate.onPress = { [weak detector] direction, source in
+                detector?.press(direction, source: source)
+            }
+            if candidate.start() {
+                hid = candidate
+                hidMonitor = candidate
+            }
+        }
+
+        // Fallback source: the volume-delta sampler. It stays installed so the trigger
+        // still works if the HID client never delivers an event; it goes quiet as soon as
+        // HID proves it is alive.
+        let monitor = VolumeKeyMonitor(detector: detector)
+        monitor.hidIsPrimary = { [weak hid] in hid?.hasReceivedVolumeEvent ?? false }
+        monitor.start(suppressHUD: keySuppressesHUD, restoreVolume: true)
+        volumeMonitor = monitor
+
+        keyStatus = hidMonitor == nil ? "音量采样后备（IOHID 不可用）" : "IOHID 事件 + 采样后备"
+        trlog(.info, "KEY", "按键触发就绪：真实事件源=\(hidMonitor != nil ? "IOHID" : "音量采样")")
+    }
+
+    private func stopKeyMonitor() {
+        hidMonitor?.stop()
+        hidMonitor = nil
+        volumeMonitor?.stop()
+        volumeMonitor = nil
+        keyDetector.reset()
+        keyStatus = "未启用"
+        trlog(.info, "KEY", "音量键监听已停止")
+    }
+
+    /// Rebuilds the key-event path after a setting changed. Exposed for the view.
+    func restartKeyMonitor() {
+        guard watchVolumeKeys else { return }
+        stopKeyMonitor()
+        installKeyMonitor()
+    }
+
+    /// Keeps the process alive in the background while any trigger is enabled. Without it
+    /// the app is suspended and no trigger can fire.
+    func updateKeepAlive() {
+        let wanted = keepAliveInBackground && (watchCalls || watchApps || watchVolumeKeys)
+        if wanted, keepAlive == nil {
+            let alive = BackgroundKeepAlive()
+            if alive.start() {
+                keepAlive = alive
+            }
+        } else if !wanted, keepAlive != nil {
+            keepAlive?.stop()
+            keepAlive = nil
         }
     }
 
-    private func installKeyMonitor() {
-        if let keyMonitor {
-            keyMonitor.retryVolumeViewIfNeeded()
-            return
-        }
-        let monitor = VolumeKeyMonitor()
-        monitor.onPress = { name in trlog(.info, "KEY", "按键事件：\(name)") }
-        monitor.onCombo = { [weak self] description in
-            Task { @MainActor in self?.handleVolumeCombo(description) }
-        }
-        monitor.start(suppressHUD: keySuppressesHUD, restoreVolume: true)
-        keyMonitor = monitor
+    func applyKeepAliveSetting() {
+        updateKeepAlive()
     }
 
     private func handleVolumeCombo(_ description: String) {
@@ -495,8 +673,9 @@ final class AppModel: ObservableObject {
             VolumeKeyMonitor.feedback(pulses: 2)
         } else {
             manualWants = true
+            manualTrigger = .volumeKey
             autoMutedUntilSourcesEnd = false
-            trlog(.info, "KEY", "按键开始录音（\(description)）")
+            trlog(.info, "KEY", "按键开始录音（\(description)），目标 \(effectiveTarget().label)")
             reevaluate()
             VolumeKeyMonitor.feedback(pulses: 1)
         }
@@ -504,7 +683,15 @@ final class AppModel: ObservableObject {
 
     private func handle(_ event: CallEvent) {
         callStateText = event.state.label
-        trlog(.info, "CT", "通话事件 \(event.state.label) 号码=\(event.address ?? "-") 名称=\(event.displayName ?? "-") 并发=\(event.activeCallCount)")
+        if event.address != nil || event.displayName != nil || event.uniqueIdentifier != nil {
+            latestCall = CallInfo(address: event.address,
+                                  name: event.displayName,
+                                  type: event.callType,
+                                  outgoing: event.isOutgoing,
+                                  state: event.state.label)
+        }
+        trlog(.info, "CT", "通话事件 \(event.state.label) 号码=\(event.address ?? "-") 名称=\(event.displayName ?? "-") "
+              + "类型=\(event.callType ?? "-") 去电=\(event.isOutgoing.map { $0 ? "是" : "否" } ?? "-") 并发=\(event.activeCallCount)")
 
         guard watchCalls else { return }
 
@@ -623,6 +810,8 @@ struct ContentView: View {
                     InfoRow(title: "私有 tap", value: model.tapAvailability)
                     InfoRow(title: "音频进程枚举(诊断)", value: model.audioProcessStatus)
                     InfoRow(title: "应用音频监听", value: model.appAudioStatus)
+                    InfoRow(title: "按键事件源", value: model.keyStatus)
+                    InfoRow(title: "当前目标", value: model.effectiveTarget().label)
                     InfoRow(title: "当前文件", value: model.currentFile)
                     InfoRow(title: "时长", value: String(format: "%.1f 秒", model.elapsed))
                     InfoRow(title: "音频包", value: "\(model.packets)")
@@ -630,13 +819,17 @@ struct ContentView: View {
                 }
 
                 Section(header: Text("录音")) {
-                    Picker("手动目标", selection: $model.targetChoice) {
+                    Picker("录音目标", selection: $model.targetChoice) {
                         ForEach(TargetChoice.allCases) { choice in
                             Text(choice.rawValue).tag(choice)
                         }
                     }
                     if model.targetChoice == .process {
                         TextField("PID", text: $model.customPID).keyboardType(.numberPad)
+                    }
+                    if model.targetChoice == .auto {
+                        Text("默认：通话中抓通话音频，未通话时抓麦克风。上面的手动目标仅在未通话时生效。")
+                            .font(.caption2).foregroundColor(.secondary)
                     }
                     Button(model.isRecording && model.currentFile != "-" ? "停止录制" : "开始录制") {
                         model.toggleManualRecording()
@@ -652,10 +845,24 @@ struct ContentView: View {
                     TextField("应用 Bundle ID（逗号分隔）", text: $model.watchedBundleIDs)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
-                    Text("触发信号：音频中断 / 次要音频 / CallKit 通话。目标按 Bundle ID 匹配运行中的 App；未匹配到则回退到上面的手动目标。")
+                    Text("触发信号：CallKit 通话 / 音频中断 / 次要音频。CallKit 通话一定会触发；音频中断与次要音频只在能按 Bundle ID 匹配到监听的 App 时触发，避免任意 App 放音频就开始录。")
                         .font(.caption2).foregroundColor(.secondary)
                     Toggle("音量键触发", isOn: Binding(get: { model.watchVolumeKeys },
                                                      set: { _ in model.toggleWatchVolumeKeys() }))
+                    Toggle("后台保持存活", isOn: Binding(get: { model.keepAliveInBackground },
+                                                     set: { newValue in
+                                                         model.keepAliveInBackground = newValue
+                                                         model.applyKeepAliveSetting()
+                                                     }))
+                    Text("循环播放一段静音音频，避免切到其他 App 后本进程被挂起、收不到按键与通话事件。目标软件用守护进程达到同样效果。")
+                        .font(.caption2).foregroundColor(.secondary)
+                    Toggle("使用 IOHID 真实按键事件", isOn: Binding(get: { model.useHIDKeyEvents },
+                                                          set: { newValue in
+                                                              model.useHIDKeyEvents = newValue
+                                                              model.restartKeyMonitor()
+                                                          }))
+                    Text("优先订阅系统级真实按键事件（可识别同时按下的组合）。若某些系统上按键异常，可关掉改用音量采样。")
+                        .font(.caption2).foregroundColor(.secondary)
                     Toggle("按键不显示音量 HUD", isOn: $model.keySuppressesHUD)
                     Text("打开后会插入一个屏幕外的音量控件来压掉系统音量提示。若打开后音量键失去反应，请关掉它——那个控件会接管音量键。")
                         .font(.caption2).foregroundColor(.secondary)
@@ -666,7 +873,7 @@ struct ContentView: View {
                                                       }))
                     Text("若录音时对方听不到你、或微信音频异常，把它关掉（依赖 CanRecordWithoutSessionActivation 权限）。")
                         .font(.caption).foregroundColor(.secondary)
-                    Text("触发方式：音量+ 与音量- 在 0.6 秒内先后按下，或音量- 双击。开始震 1 下，停止震 2 下。")
+                    Text("触发方式：同时按音量+ 与音量-（0.8 秒内先后按下即可），或音量-／音量+ 双击。开始震 1 下，停止震 2 下。")
                         .font(.caption).foregroundColor(.secondary)
                     Toggle("隐藏桌面图标", isOn: Binding(get: { model.hideIcon },
                                                        set: { _ in model.toggleHideIcon() }))
@@ -699,6 +906,9 @@ struct ContentView: View {
                                                                           dateStyle: .short,
                                                                           timeStyle: .short)))
                                     .font(.caption2).foregroundColor(.secondary)
+                                if let meta = recording.meta {
+                                    Text(metaLine(meta)).font(.caption2).foregroundColor(.secondary)
+                                }
                             }
                             Spacer()
                             Button(playing == recording.url ? "停止" : "播放") {
@@ -749,6 +959,18 @@ struct ContentView: View {
         // Installing the volume-key monitor needs a key window for its hidden
         // MPVolumeView, so the triggers are assembled here rather than in init().
         .onAppear { model.startEnabledTriggers() }
+    }
+
+    /// One line summarising a recording's sidecar, shown under its name.
+    private func metaLine(_ meta: RecordingMeta) -> String {
+        var parts = ["触发:\(meta.trigger)", "目标:\(meta.target)"]
+        if let call = meta.call {
+            let who = call.name ?? call.address ?? "未知号码"
+            let direction = call.outgoing.map { $0 ? "去电" : "来电" } ?? ""
+            parts.append("通话:\(who)\(direction.isEmpty ? "" : "·\(direction)")")
+        }
+        if meta.silent { parts.append("近乎静音") }
+        return parts.joined(separator: " · ")
     }
 
     private func flags(for info: AudioProcessInfo) -> String {

@@ -117,6 +117,13 @@ public final class TapRecorder {
     private var tap: AnyObject?
     private var destination: URL
 
+    /// Human-readable target ("system-audio", "pid:123", …) for the log and the sidecar.
+    public let targetLabel: String
+    /// When the recorder was created, for the metadata sidecar.
+    public let startedAt = Date()
+    /// Where the recording is written.
+    public var fileURL: URL { destination }
+
     public private(set) var isRunning = false
 
     /// Highest sample magnitude in the most recent buffer (0...1). A non-zero value
@@ -155,6 +162,7 @@ public final class TapRecorder {
 
     public init(target: TapTarget, sampleRate: Double, channels: UInt32, fileURL: URL) throws {
         destination = fileURL
+        targetLabel = target.label
 
         guard let requested = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                             sampleRate: sampleRate,
