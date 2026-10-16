@@ -54,8 +54,7 @@ enum CrashGuard {
         _ = banner.count
 
         NSSetUncaughtExceptionHandler { exception in
-            let stack = exception.callStackSymbols.joined(separator: "
-")
+            let stack = exception.callStackSymbols.joined(separator: "\n")
             append("""
             [\(timestamp())] 未捕获的 Objective-C 异常
               name: \(exception.name.rawValue)

@@ -116,8 +116,7 @@ final class AppModel: ObservableObject {
         // lines of this session so "复制全部日志" carries it without the Files app.
         if let previousCrash = CrashGuard.consumePreviousCrash() {
             trlog(.error, "CRASH", "===== 上次运行崩溃，记录如下 =====")
-            for line in previousCrash.split(separator: "
-", omittingEmptySubsequences: false) {
+            for line in previousCrash.split(separator: "\n", omittingEmptySubsequences: false) {
                 trlog(.error, "CRASH", String(line))
             }
             trlog(.error, "CRASH", "===== 崩溃记录结束 =====")
