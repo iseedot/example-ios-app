@@ -26,7 +26,12 @@ final class VolumeKeyMonitor {
     private enum Press { case up, down }
 
     private var observation: NSKeyValueObservation?
+    private var sliderObservation: NSKeyValueObservation?
     private var volumeView: MPVolumeView?
+    /// Both the session volume and the slider can report the same press; the second
+    /// signal for the same direction inside this window is the echo, not a new press.
+    private let echoWindow: TimeInterval = 0.15
+    private var lastPress: (press: Press, at: Date)?
     private var recent: [(press: Press, at: Date)] = []
     private var lastKnownVolume: Float = 0
     private var suppressVolumeHUD = true
@@ -56,15 +61,23 @@ final class VolumeKeyMonitor {
 
         observation = session.observe(\.outputVolume, options: [.new, .old]) { [weak self] _, change in
             guard let self, let new = change.newValue, let old = change.oldValue, new != old else { return }
-            let press: Press = new > old ? .up : .down
-            self.handle(press: press, volume: new)
+            trlog(.debug, "KEY", "会话音量变化 \(String(format: "%.3f -> %.3f", old, new))")
+            self.handle(press: new > old ? .up : .down, volume: new)
         }
 
         if suppressVolumeHUD {
             installVolumeView()
         }
+
+        let sliderValue = volumeSlider.map { String(format: "%.3f", $0.value) } ?? "（无 slider）"
         trlog(.info, "KEY", "音量键监听已启动（HUD 抑制=\(suppressVolumeHUD)，音量还原=\(restoreVolume)，"
-              + "当前音量 \(String(format: "%.2f", session.outputVolume))）")
+              + "会话音量 \(String(format: "%.3f", session.outputVolume))，slider \(sliderValue)）")
+        if session.outputVolume <= 0.005 {
+            trlog(.warn, "KEY", "当前音量为 0：此时「音量-」不会产生变化事件（已在下界），"
+                  + "请用「音量+」双击，或先把音量调到中间再试")
+        } else if session.outputVolume >= 0.995 {
+            trlog(.warn, "KEY", "当前音量已到最大：「音量+」不会产生变化事件，请用「音量-」双击")
+        }
     }
 
     /// Called from the view when it appears: by then a key window exists.
@@ -99,6 +112,16 @@ final class VolumeKeyMonitor {
         window.addSubview(view)
         volumeView = view
         needsVolumeViewRetry = false
+        // The slider reports the same presses as the session volume. Observing both and
+        // dropping the duplicate makes the trigger work even if one of them is silent.
+        if let slider = view.subviews.compactMap({ $0 as? UISlider }).first {
+            sliderObservation = slider.observe(\.value, options: [.new, .old]) { [weak self] _, change in
+                guard let self, let new = change.newValue, let old = change.oldValue,
+                      abs(new - old) > 0.0001 else { return }
+                trlog(.debug, "KEY", "slider 变化 \(String(format: "%.3f -> %.3f", old, new))")
+                self.handle(press: new > old ? .up : .down, volume: new)
+            }
+        }
         trlog(.info, "KEY", "已安装隐藏 MPVolumeView（音量 HUD 已抑制）")
     }
 
@@ -120,7 +143,15 @@ final class VolumeKeyMonitor {
     private func handle(press: Press, volume: Float) {
         let now = Date()
 
+        // The session volume and the slider both report one press; ignore the echo.
+        if let last = lastPress, last.press == press,
+           now.timeIntervalSince(last.at) < echoWindow {
+            return
+        }
+        lastPress = (press, now)
+
         // A press that stopped changing the slider value still counts.
+        let sliderBefore = volumeSlider.map { $0.value }
         if restoreVolume, let slider = volumeSlider, abs(slider.value - lastKnownVolume) > 0.0001 {
             slider.value = lastKnownVolume
         }
@@ -147,7 +178,9 @@ final class VolumeKeyMonitor {
             trlog(.info, "KEY", "触发按键组合：\(description)")
             onCombo?(description)
         } else {
-            trlog(.debug, "KEY", "按键：\(press == .up ? "音量+" : "音量-")（等待组合）")
+            let sliderText = sliderBefore.map { String(format: "%.3f", $0) } ?? "-"
+            trlog(.info, "KEY", "按键：\(press == .up ? "音量+" : "音量-")（等待组合；"
+                  + "事件值 \(String(format: "%.3f", volume))，改前 slider \(sliderText)）")
         }
         lastKnownVolume = AVAudioSession.sharedInstance().outputVolume
     }

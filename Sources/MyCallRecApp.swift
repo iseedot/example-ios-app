@@ -21,6 +21,9 @@ struct MyCallRecApp: App {
     @StateObject private var model = AppModel()
 
     init() {
+        // Crash handlers go in first: everything after this point is diagnosable from
+        // the log even if a private API raises an exception.
+        CrashGuard.install()
         AppModel.configureAudioSession()
         Log.shared.start()
     }
@@ -109,6 +112,17 @@ final class AppModel: ObservableObject {
             if self.logLines.count > 400 { self.logLines.removeLast(self.logLines.count - 400) }
         }
 
+        // A previous run that died leaves its reason on disk; surface it as the first
+        // lines of this session so "复制全部日志" carries it without the Files app.
+        if let previousCrash = CrashGuard.consumePreviousCrash() {
+            trlog(.error, "CRASH", "===== 上次运行崩溃，记录如下 =====")
+            for line in previousCrash.split(separator: "
+", omittingEmptySubsequences: false) {
+                trlog(.error, "CRASH", String(line))
+            }
+            trlog(.error, "CRASH", "===== 崩溃记录结束 =====")
+        }
+
         tapAvailability = (NSClassFromString("ATAudioTap") != nil && NSClassFromString("ATAudioTapDescription") != nil)
             ? "可用" : "不可用（缺少私有类）"
 
@@ -116,7 +130,7 @@ final class AppModel: ObservableObject {
         coreTelephonyStatus = probe.available ? "可用（\(probe.detail)）" : "不可用（\(probe.detail)）"
         audioProcessStatus = AudioProcessProbe.isAvailable ? "探测中" : "不可用（AudioObjectGetPropertyData 未找到）"
 
-        trlog(.info, "APP", "MyCallRec 启动；私有 tap \(tapAvailability)")
+        trlog(.info, "APP", "MyCallRec 启动；私有 tap \(tapAvailability)；激活音频会话=\(activatesAudioSession)")
         trlog(.info, "CT", "CoreTelephony \(coreTelephonyStatus)")
         trlog(.info, "AUDIO", "CoreAudio 进程对象 API：\(audioProcessStatus)")
 
@@ -156,7 +170,11 @@ final class AppModel: ObservableObject {
                 trlog(.info, "AUDIO", "音频会话已激活：\(session.category.rawValue)")
             } else {
                 // Rely on com.apple.coreaudio.CanRecordWithoutSessionActivation instead.
-                trlog(.info, "AUDIO", "音频会话未激活（仅设置分类），避免影响被录音的应用")
+                // Deactivate as well: an active play-and-record session coexists with
+                // the tap queue, and this switch is the lever if the tap refuses to
+                // build while the session is up.
+                try? session.setActive(false, options: [.notifyOthersOnDeactivation])
+                trlog(.info, "AUDIO", "音频会话已停用（仅设置分类），避免影响被录音的应用")
             }
         } catch {
             trlog(.error, "AUDIO", "音频会话配置失败：\(error)")
@@ -676,8 +694,14 @@ struct ContentView: View {
 
                 Section(header: Text("日志")) {
                     Button("复制全部日志") { model.copyLogToPasteboard() }
+                    Button("分享日志文件") {
+                        trlog(.info, "APP", "弹出日志分享面板")
+                        LogSharing.present(items: Log.shared.shareableFiles())
+                    }
                     Button("清空日志") { model.clearLog() }
-                    Text("日志同时写入 Documents/logs/MyCallRec.log，可用「文件」App 取出")
+                    Text("日志文件：\(Log.shared.logFileURL?.path ?? "不可用")")
+                        .font(.caption2).foregroundColor(.secondary)
+                    Text("若 App 闪退，重新打开后「复制全部日志」里会带上崩溃原因（含异常名与调用栈）。")
                         .font(.caption2).foregroundColor(.secondary)
                     ForEach(model.logLines, id: \.self) { line in
                         Text(line).font(.caption2).foregroundColor(.secondary)

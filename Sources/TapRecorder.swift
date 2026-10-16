@@ -1,10 +1,19 @@
 //
 //  TapRecorder.swift
-//  callrec — Phase 1 proof of concept, Swift implementation.
+//  MyCallRec — record a private audio tap into a CAF file.
 //
-//  Private AudioToolbox classes are reached through the Objective-C runtime, so the
-//  target builds against the public SDK only. Interface facts came from the static
-//  analysis in ../../analysis/TECHNIQUE-call-audio-tap.md.
+//  The private AudioToolbox classes are reached through the Objective-C runtime, so the
+//  target builds against the public SDK only. The call sequence follows the upstream
+//  GPL reference implementation (cli/call-recorder.mm, cli/dtmf-decoder.mm) exactly,
+//  because the order and the flag matter:
+//
+//    1. ATAudioTapDescription initTapInternalWithFormat:PIDs:   (iOS 16+)
+//       fallback initProcessTapInternalWithFormat:PID:          (older, PID is an int)
+//    2. [[ATAudioTap alloc] initWithTapDescription:]
+//    3. AudioQueueNewInput(..., 0x800, &queue)                  <- tap flag, not 0
+//    4. AudioQueueSetProperty(queue, 'qtob', tapPointer, 8)
+//    5. allocate AND enqueue every buffer, then AudioQueueStart
+//    6. read the queue's actual StreamDescription back and use it for writing
 //
 
 import Foundation
@@ -51,6 +60,14 @@ public enum TapTarget: Equatable {
 /// Documented by upstream's GPL header as four-char code 'qtob'.
 let kTapOutputBypassProperty = AudioQueuePropertyID(0x71746F62)
 
+/// Reserved flag the tap queues are created with upstream. A plain microphone queue is
+/// created with 0, so this is what makes the queue a tap queue.
+private let kTapQueueFlags: UInt32 = 0x800
+
+/// Upstream's buffer bounds (cli/call-recorder.mm).
+private let kMinimumBufferSize: UInt32 = 0x4000
+private let kMaximumBufferSize: UInt32 = 0x50000
+
 public enum TapRecorderError: Error, CustomStringConvertible {
     case privateClassesUnavailable
     case formatRejected
@@ -63,15 +80,20 @@ public enum TapRecorderError: Error, CustomStringConvertible {
         case .privateClassesUnavailable: return "private ATAudioTap classes are not present on this OS build"
         case .formatRejected: return "AVAudioFormat rejected the requested sample rate / channel count"
         case .tapCreationFailed: return "the private tap description or tap object could not be created"
-        case .queueSetupFailed(let status): return "AudioQueue setup failed (OSStatus \(status))"
-        case .fileCreationFailed(let status): return "AudioFile creation failed (OSStatus \(status))"
+        case .queueSetupFailed(let status):
+            return "AudioQueue setup failed (OSStatus \(status) \(TapRecorder.fourCC(status)))"
+        case .fileCreationFailed(let status):
+            return "AudioFile creation failed (OSStatus \(status) \(TapRecorder.fourCC(status)))"
         }
     }
 }
 
+// The two init selectors take different argument kinds: the modern one takes an array of
+// NSNumber, the legacy one takes a plain int. Casting the legacy one as an object pointer
+// would put the low 32 bits of a pointer where the pid is expected.
 private typealias AllocFn = @convention(c) (AnyClass, Selector) -> AnyObject?
-private typealias InitOneArgFn = @convention(c) (AnyObject, Selector, AnyObject?) -> AnyObject?
-private typealias InitTwoArgFn = @convention(c) (AnyObject, Selector, AnyObject?, AnyObject?) -> AnyObject?
+private typealias InitOneObjectFn = @convention(c) (AnyObject, Selector, AnyObject?, AnyObject?) -> AnyObject?
+private typealias InitObjectAndIntFn = @convention(c) (AnyObject, Selector, AnyObject?, Int32) -> AnyObject?
 
 private func tr_implementation(of cls: AnyClass, _ name: String, classMethod: Bool = false) -> IMP? {
     let selector = NSSelectorFromString(name)
@@ -83,11 +105,12 @@ private func tr_implementation(of cls: AnyClass, _ name: String, classMethod: Bo
 public final class TapRecorder {
     private var queue: AudioQueueRef?
     private var file: AudioFileID?
-    private var buffers: [AudioQueueBufferRef?] = []
+    private var buffers: [AudioQueueBufferRef] = []
     private var format = AudioStreamBasicDescription()
     private var packetIndex: Int64 = 0
     private let lock = NSLock()
     private var storedPackets: UInt64 = 0
+    /// Held for the whole recording: the queue keeps an unretained reference.
     private var tap: AnyObject?
     private var destination: URL
 
@@ -117,23 +140,33 @@ public final class TapRecorder {
         recorder.handle(buffer: buffer, queue: queue)
     }
 
+    /// Renders an OSStatus four-character result so a failure is readable in the log.
+    static func fourCC(_ status: OSStatus) -> String {
+        let raw = UInt32(bitPattern: status)
+        guard raw >= 0x2020_2020, raw <= 0x7E7E_7E7E else { return "" }
+        let bytes = [UInt8((raw >> 24) & 0xFF), UInt8((raw >> 16) & 0xFF),
+                     UInt8((raw >> 8) & 0xFF), UInt8(raw & 0xFF)]
+        guard let text = String(bytes: bytes, encoding: .ascii) else { return "" }
+        return "('\(text)')"
+    }
+
     public init(target: TapTarget, sampleRate: Double, channels: UInt32, fileURL: URL) throws {
         destination = fileURL
 
-        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                         sampleRate: sampleRate,
-                                         channels: AVAudioChannelCount(channels),
-                                         interleaved: true) else {
+        guard let requested = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                            sampleRate: sampleRate,
+                                            channels: AVAudioChannelCount(channels),
+                                            interleaved: true) else {
             throw TapRecorderError.formatRejected
         }
-        self.format = format.streamDescription.pointee
+        self.format = requested.streamDescription.pointee
+        trlog(.info, "TAP", "请求格式：\(Self.describe(self.format))")
 
         guard let descriptionClass = NSClassFromString("ATAudioTapDescription"),
               let tapClass = NSClassFromString("ATAudioTap") else {
             throw TapRecorderError.privateClassesUnavailable
         }
 
-        // ATAudioTapDescription: prefer the iOS 16+ PIDs: variant and fall back to the older PID: one.
         guard let allocIMP = tr_implementation(of: descriptionClass, "alloc", classMethod: true) else {
             throw TapRecorderError.tapCreationFailed
         }
@@ -144,13 +177,20 @@ public final class TapRecorder {
 
         var description: AnyObject?
         if let imp = tr_implementation(of: descriptionClass, "initTapInternalWithFormat:PIDs:") {
-            let initialize = unsafeBitCast(imp, to: InitTwoArgFn.self)
+            // The argument is an NSArray of NSNumber, so an object-typed call is correct.
+            let initialize = unsafeBitCast(imp, to: InitOneObjectFn.self)
             description = initialize(allocated, NSSelectorFromString("initTapInternalWithFormat:PIDs:"),
-                                     format, [NSNumber(value: target.rawValue)] as NSArray)
+                                     requested, [NSNumber(value: target.rawValue)] as NSArray)
+            trlog(.info, "TAP", "使用 initTapInternalWithFormat:PIDs:（新版），PIDs=[\(target.rawValue)]")
         } else if let imp = tr_implementation(of: descriptionClass, "initProcessTapInternalWithFormat:PID:") {
-            let initialize = unsafeBitCast(imp, to: InitTwoArgFn.self)
+            // The legacy argument is a plain int; passing an object pointer here would
+            // hand the callee the low 32 bits of a pointer.
+            let initialize = unsafeBitCast(imp, to: InitObjectAndIntFn.self)
             description = initialize(allocated, NSSelectorFromString("initProcessTapInternalWithFormat:PID:"),
-                                     format, NSNumber(value: target.rawValue))
+                                     requested, target.rawValue)
+            trlog(.info, "TAP", "使用 initProcessTapInternalWithFormat:PID:（旧版），PID=\(target.rawValue)")
+        } else {
+            trlog(.error, "TAP", "ATAudioTapDescription 两个初始化选择子都不存在")
         }
         guard let description else {
             throw TapRecorderError.tapCreationFailed
@@ -164,53 +204,94 @@ public final class TapRecorder {
               let initIMP = tr_implementation(of: tapClass, "initWithTapDescription:") else {
             throw TapRecorderError.tapCreationFailed
         }
-        let initializeTap = unsafeBitCast(initIMP, to: InitOneArgFn.self)
-        guard let tapObject = initializeTap(allocatedTap, NSSelectorFromString("initWithTapDescription:"), description) else {
+        let initializeTap = unsafeBitCast(initIMP, to: InitOneObjectFn.self)
+        guard let tapObject = initializeTap(allocatedTap, NSSelectorFromString("initWithTapDescription:"), description, nil) else {
             throw TapRecorderError.tapCreationFailed
         }
         tap = tapObject
+        trlog(.info, "TAP", "ATAudioTap 已创建")
     }
 
     public func start() throws {
         guard !isRunning else { return }
+        guard let tap else { throw TapRecorderError.tapCreationFailed }
+
         var queue: AudioQueueRef?
+        // 0x800 is the flag the tap queues are created with upstream; a plain microphone
+        // queue uses 0.
         var status = AudioQueueNewInput(&format, TapRecorder.callback,
                                         Unmanaged.passUnretained(self).toOpaque(),
-                                        nil, nil, 0, &queue)
-        guard status == noErr, let queue else { throw TapRecorderError.queueSetupFailed(status) }
+                                        nil, nil, kTapQueueFlags, &queue)
+        guard status == noErr, let queue else {
+            trlog(.error, "TAP", "AudioQueueNewInput 失败：\(status) \(Self.fourCC(status))")
+            throw TapRecorderError.queueSetupFailed(status)
+        }
         self.queue = queue
+        trlog(.info, "TAP", "AudioQueueNewInput 成功（flags \(kTapQueueFlags)）")
 
-        // Bind the queue input to the tap instead of the microphone.
-        status = AudioQueueSetProperty(queue, kTapOutputBypassProperty, &tap, 8)
+        // Bind the queue input to the tap instead of the microphone. Upstream passes the
+        // tap pointer itself for an 8 byte payload.
+        let tapPointer = Unmanaged.passUnretained(tap).toOpaque()
+        status = AudioQueueSetProperty(queue, kTapOutputBypassProperty, tapPointer, 8)
         guard status == noErr else {
+            trlog(.error, "TAP", "AudioQueueSetProperty('qtob') 失败：\(status) \(Self.fourCC(status))")
             AudioQueueDispose(queue, true)
             self.queue = nil
             throw TapRecorderError.queueSetupFailed(status)
+        }
+        trlog(.info, "TAP", "AudioQueueSetProperty('qtob') 成功")
+
+        // The queue may not give back what was requested, so adopt the real format.
+        var actual = AudioStreamBasicDescription()
+        var actualSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        if AudioQueueGetProperty(queue, kAudioQueueProperty_StreamDescription, &actual, &actualSize) == noErr,
+           actual.mSampleRate > 0, actual.mChannelsPerFrame > 0 {
+            format = actual
+            trlog(.info, "TAP", "队列实际格式：\(Self.describe(format))")
+        } else {
+            trlog(.warn, "TAP", "读不到队列的 StreamDescription，沿用请求格式")
         }
 
         var file: AudioFileID?
         status = AudioFileCreateWithURL(destination as CFURL, kAudioFileCAFType, &format,
                                         AudioFileFlags.eraseFile, &file)
         guard status == noErr, let file else {
+            trlog(.error, "TAP", "AudioFileCreateWithURL 失败：\(status) \(Self.fourCC(status))")
             AudioQueueDispose(queue, true)
             self.queue = nil
             throw TapRecorderError.fileCreationFailed(status)
         }
         self.file = file
 
-        let bytesPerPacket = format.mBytesPerPacket != 0 ? format.mBytesPerPacket : 4 * format.mChannelsPerFrame
-        let bufferByteSize = UInt32(format.mSampleRate * Double(bytesPerPacket) * 0.5)
-        buffers = Array(repeating: nil, count: 3)
+        let bytesPerPacket = format.mBytesPerPacket != 0
+            ? format.mBytesPerPacket
+            : max(1, format.mBytesPerFrame)
+        let wanted = UInt32(format.mSampleRate * Double(bytesPerPacket) * 0.5)
+        let bufferByteSize = min(max(wanted, kMinimumBufferSize), kMaximumBufferSize)
+
+        buffers.reserveCapacity(3)
         for index in 0..<3 {
             var buffer: AudioQueueBufferRef?
-            if AudioQueueAllocateBuffer(queue, max(bufferByteSize, 16384), &buffer) == noErr {
-                buffers[index] = buffer
+            guard AudioQueueAllocateBuffer(queue, bufferByteSize, &buffer) == noErr, let buffer else {
+                trlog(.error, "TAP", "AudioQueueAllocateBuffer 第 \(index + 1) 个失败")
+                continue
             }
+            // Enqueue before starting: a tap queue with no buffers delivers nothing.
+            let enqueueStatus = AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
+            if enqueueStatus != noErr {
+                trlog(.warn, "TAP", "AudioQueueEnqueueBuffer 第 \(index + 1) 个失败：\(enqueueStatus)")
+            }
+            buffers.append(buffer)
         }
+        trlog(.info, "TAP", "已分配并入队 \(buffers.count) 个缓冲区，每个 \(bufferByteSize) 字节")
 
         status = AudioQueueStart(queue, nil)
-        guard status == noErr else { throw TapRecorderError.queueSetupFailed(status) }
+        guard status == noErr else {
+            trlog(.error, "TAP", "AudioQueueStart 失败：\(status) \(Self.fourCC(status))")
+            throw TapRecorderError.queueSetupFailed(status)
+        }
         isRunning = true
+        trlog(.info, "TAP", "AudioQueueStart 成功，开始接收音频")
     }
 
     fileprivate func handle(buffer: AudioQueueBufferRef, queue: AudioQueueRef) {
@@ -221,7 +302,9 @@ public final class TapRecorder {
         }
         updatePeak(from: buffer, byteCount: byteCount)
         if byteCount > 0, let file {
-            let bytesPerPacket = format.mBytesPerPacket != 0 ? format.mBytesPerPacket : 4 * format.mChannelsPerFrame
+            let bytesPerPacket = format.mBytesPerPacket != 0
+                ? format.mBytesPerPacket
+                : max(1, format.mBytesPerFrame)
             var packets = byteCount / bytesPerPacket
             if packets > 0 {
                 let status = AudioFileWritePackets(file, false, byteCount, nil, packetIndex, &packets,
@@ -241,18 +324,34 @@ public final class TapRecorder {
 
     /// Samples the buffer to report a peak level; a cheap way to tell audio from silence.
     private func updatePeak(from buffer: AudioQueueBufferRef, byteCount: UInt32) {
-        guard byteCount >= 4, format.mBitsPerChannel == 32 else { return }
-        // mAudioData is imported as an implicitly unwrapped pointer, so it is used directly.
+        guard byteCount >= 4 else { return }
         let data = buffer.pointee.mAudioData
-        let sampleCount = Int(byteCount) / MemoryLayout<Float32>.size
-        let samples = data.assumingMemoryBound(to: Float32.self)
         var peak: Float = 0
-        var index = 0
-        while index < sampleCount {
-            let value = abs(samples[index])
-            if value > peak { peak = value }
-            index += 4
+
+        switch (format.mBitsPerChannel, format.mFormatFlags & kAudioFormatFlagIsFloat != 0) {
+        case (32, true):
+            let count = Int(byteCount) / MemoryLayout<Float32>.size
+            let samples = data.assumingMemoryBound(to: Float32.self)
+            var index = 0
+            while index < count {
+                let value = abs(samples[index])
+                if value > peak { peak = value }
+                index += 4
+            }
+        case (16, false):
+            let count = Int(byteCount) / MemoryLayout<Int16>.size
+            let samples = data.assumingMemoryBound(to: Int16.self)
+            var index = 0
+            while index < count {
+                let value = abs(Float(samples[index]) / 32768.0)
+                if value > peak { peak = value }
+                index += 4
+            }
+        default:
+            // Unknown sample layout: report "no measurement" rather than a wrong number.
+            return
         }
+
         peakAmplitude = peak
         if peak > maxPeakAmplitude { maxPeakAmplitude = peak }
     }
@@ -271,6 +370,16 @@ public final class TapRecorder {
         }
         buffers = []
         tap = nil
+    }
+
+    /// Human-readable ASBD, so the log shows what the tap really produced.
+    private static func describe(_ format: AudioStreamBasicDescription) -> String {
+        let float = format.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        let interleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        return String(format: "%.0f Hz / %u ch / %u bit / %@ / %@ / %u bytes-per-packet",
+                      format.mSampleRate, format.mChannelsPerFrame, format.mBitsPerChannel,
+                      float ? "float" : "int", interleaved ? "interleaved" : "planar",
+                      format.mBytesPerPacket)
     }
 
     deinit { stop() }

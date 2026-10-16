@@ -49,6 +49,21 @@ final class Log {
 
     private init() {}
 
+    /// File path of the run log, for the share sheet.
+    var logFileURL: URL? {
+        logDirectory?.appendingPathComponent("MyCallRec.log")
+    }
+
+    /// Items for the share sheet: the log file when it exists, otherwise the transcript
+    /// already in memory. The file is preferred because it also holds the lines written
+    /// before a crash.
+    func shareableFiles() -> [Any] {
+        if let logFileURL, FileManager.default.fileExists(atPath: logFileURL.path) {
+            return [logFileURL]
+        }
+        return [transcript()]
+    }
+
     var logDirectory: URL? {
         guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
             return nil
