@@ -66,6 +66,7 @@ final class AppModel: ObservableObject {
     @Published var coreTelephonyStatus: String = "未检测"
     @Published var tapAvailability: String = "未检测"
     @Published var audioProcessStatus: String = "未检测"
+    @Published var appAudioStatus: String = "未安装"
     @Published var audioProcesses: [AudioProcessInfo] = []
 
     @Published var watchCalls = true
@@ -83,7 +84,10 @@ final class AppModel: ObservableObject {
     private var recorder: TapRecorder?
     private var watcher: CallWatcher?
     private var keyMonitor: VolumeKeyMonitor?
+    private var audioUseWatcher: AudioUseWatcher?
     private var ticker: Timer?
+    /// Guards `startEnabledTriggers`: the view calls it on every appearance.
+    private var triggersStarted = false
 
     // Which sources currently want a recording.
     private var manualWants = false
@@ -110,14 +114,36 @@ final class AppModel: ObservableObject {
 
         let probe = CallWatcher.probe()
         coreTelephonyStatus = probe.available ? "可用（\(probe.detail)）" : "不可用（\(probe.detail)）"
-        audioProcessStatus = AudioProcessProbe.isAvailable ? "可用" : "不可用（AudioObjectGetPropertyData 未找到）"
+        audioProcessStatus = AudioProcessProbe.isAvailable ? "探测中" : "不可用（AudioObjectGetPropertyData 未找到）"
 
         trlog(.info, "APP", "MyCallRec 启动；私有 tap \(tapAvailability)")
         trlog(.info, "CT", "CoreTelephony \(coreTelephonyStatus)")
-        trlog(.info, "AUDIO", "音频进程枚举 \(audioProcessStatus)")
+        trlog(.info, "AUDIO", "CoreAudio 进程对象 API：\(audioProcessStatus)")
 
         refreshAudioProcesses()
         startTicker()
+    }
+
+    /// Installs every trigger whose switch is on.
+    ///
+    /// The switches default to on, so this must run at launch: previously only the
+    /// toggle's setter called the installers, which left the UI showing "on" with
+    /// nothing actually installed — the log showed no "通话监听已启动" and no
+    /// "音量键监听已启动" line, and no trigger could ever fire.
+    ///
+    /// The volume-key monitor needs a key window for its hidden MPVolumeView, so the
+    /// view calls this from `onAppear` rather than from `init`.
+    func startEnabledTriggers() {
+        guard !triggersStarted else {
+            keyMonitor?.retryVolumeViewIfNeeded()
+            return
+        }
+        triggersStarted = true
+        trlog(.info, "APP", "装配触发源：通话=\(watchCalls) 应用=\(watchApps) 音量键=\(watchVolumeKeys)")
+
+        if watchCalls { startCallWatcher() }
+        if watchApps { startAudioUseWatcher() }
+        if watchVolumeKeys { installKeyMonitor() }
     }
 
     static func configureAudioSession(activate: Bool = true) {
@@ -139,34 +165,41 @@ final class AppModel: ObservableObject {
 
     // MARK: - Audio processes
 
+    /// Bundle identifiers the application-audio trigger watches.
+    var watchedIdentifiers: [String] {
+        watchedBundleIDs
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Refreshes the pid list shown in the UI. The HAL probe reports its own failure
+    /// once; afterwards this stays at debug level so the three-second ticker cannot
+    /// flood the log.
     func refreshAudioProcesses() {
         let probed = AudioProcessProbe.processes()
+        audioProcessStatus = AudioProcessProbe.statusDescription
         if !probed.isEmpty {
             audioProcesses = probed
             trlog(.info, "AUDIO", "音频进程 \(probed.count) 个：\(AudioProcessProbe.describe(probed))")
             return
         }
-        // Fallback: the CoreAudio probe depends on undocumented selector codes, so a
-        // sysctl listing still gives a usable PID list for manual selection.
+        // Fallback: the HAL probe cannot enumerate here, so the sysctl listing still
+        // gives a usable PID list for manual selection and for the tap target.
         let entries = ProcessList.interesting(from: ProcessList.running())
         audioProcesses = entries.map {
             AudioProcessInfo(objectID: 0, pid: $0.pid, bundleIdentifier: $0.name,
                              isRunning: true, isRunningInput: false, isRunningOutput: false)
         }
-        trlog(.warn, "AUDIO", "音频进程 API 无结果，回退到 sysctl：\(entries.count) 个候选（仅可用于手动选择 PID）")
+        trlog(.debug, "AUDIO", "sysctl 候选 \(entries.count) 个：\(entries.map { "\($0.pid):\($0.name)" }.joined(separator: " "))")
     }
 
-    private func matchingWatchedProcess() -> AudioProcessInfo? {
-        let identifiers = watchedBundleIDs
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
-            .filter { !$0.isEmpty }
-        guard !identifiers.isEmpty else { return nil }
-        return AudioProcessProbe.processes().first { info in
-            guard info.isRunningInput else { return false }
-            let identifier = (info.bundleIdentifier ?? "").lowercased()
-            return identifiers.contains(identifier)
+    /// pid of the first watched application that is running, or nil.
+    private func watchedAppPID() -> Int32? {
+        for identifier in watchedIdentifiers {
+            if let pid = AppProcessFinder.pid(forBundleIdentifier: identifier) { return pid }
         }
+        return nil
     }
 
     // MARK: - Recording control
@@ -300,10 +333,67 @@ final class AppModel: ObservableObject {
 
     func toggleWatchApps() {
         watchApps.toggle()
-        trlog(.info, "APP", "应用音频自动录音：\(watchApps ? "开" : "关")，监听 \(watchedBundleIDs)")
-        if !watchApps {
+        trlog(.info, "APP", "应用音频自动录音：\(watchApps ? "开" : "关")，监听 \(watchedIdentifiers)")
+        if watchApps {
+            startAudioUseWatcher()
+        } else {
+            audioUseWatcher?.stop()
+            audioUseWatcher = nil
             appWants = false
             appWantedPID = nil
+            appAudioStatus = "已关闭"
+            reevaluate()
+        }
+    }
+
+    /// Subscribes to the audio-session and CallKit signals that a non-telephony call
+    /// produces. Returns false and reports why when it cannot be installed.
+    @discardableResult
+    private func startAudioUseWatcher() -> Bool {
+        guard audioUseWatcher == nil else { return true }
+        let watcher = AudioUseWatcher()
+        watcher.onEvent = { [weak self] event in
+            Task { @MainActor in self?.handleAudioUse(event) }
+        }
+        guard watcher.start() else {
+            trlog(.error, "APP", "应用音频监听启动失败：\(watcher.statusDetail)")
+            watchApps = false
+            appAudioStatus = "启动失败"
+            return false
+        }
+        audioUseWatcher = watcher
+        appAudioStatus = watcher.statusDetail
+        trlog(.info, "APP", "应用音频监听已启动（\(watcher.statusDetail)）")
+        return true
+    }
+
+    /// One audio-signal event. The signal only says "another app is using audio now";
+    /// the tap target and the per-recording evidence are reported by the recorder.
+    private func handleAudioUse(_ event: AudioUseEvent) {
+        switch event {
+        case .started(let kind, let detail):
+            trlog(.info, "APP", "\(kind.rawValue)：开始（\(detail)）")
+            guard watchApps else { return }
+            let pid = watchedAppPID()
+            appIdleTicks = 0
+            autoMutedUntilSourcesEnd = false
+            if !appWants {
+                appWants = true
+                appWantedPID = pid
+                trlog(.info, "APP", "应用音频触发录音；目标 \(pid.map { "pid \($0)" } ?? "未匹配到监听的 App，回退到当前目标")")
+                reevaluate()
+            } else if let pid, pid != appWantedPID {
+                trlog(.info, "APP", "应用音频目标 PID 变化 \(appWantedPID ?? -1) -> \(pid)")
+                if recorder != nil { stopRecording(reason: "目标进程变化") }
+                appWantedPID = pid
+                reevaluate()
+            }
+        case .ended(let kind, let detail):
+            trlog(.info, "APP", "\(kind.rawValue)：结束（\(detail)）")
+            guard appWants else { return }
+            appWants = false
+            appWantedPID = nil
+            appIdleTicks = 0
             reevaluate()
         }
     }
@@ -329,11 +419,15 @@ final class AppModel: ObservableObject {
         } else {
             keyMonitor?.stop()
             keyMonitor = nil
+            trlog(.info, "KEY", "音量键监听已停止")
         }
     }
 
     private func installKeyMonitor() {
-        guard keyMonitor == nil else { return }
+        if let keyMonitor {
+            keyMonitor.retryVolumeViewIfNeeded()
+            return
+        }
         let monitor = VolumeKeyMonitor()
         monitor.onPress = { name in trlog(.info, "KEY", "按键事件：\(name)") }
         monitor.onCombo = { [weak self] description in
@@ -407,34 +501,16 @@ final class AppModel: ObservableObject {
             }
         }
 
-        // Poll audio processes every three seconds: this is what starts and stops
-        // recording for applications that do not go through CallKit.
         guard tickCount % 3 == 0 else { return }
 
-        if watchApps {
-            if let info = matchingWatchedProcess() {
-                appIdleTicks = 0
-                if !appWants {
-                    appWants = true
-                    appWantedPID = info.pid
-                    trlog(.info, "APP", "检测到应用正在采集音频：\(info.displayName) pid=\(info.pid)")
-                    reevaluate()
-                } else if appWantedPID != info.pid {
-                    trlog(.info, "APP", "应用音频 PID 变化 \(appWantedPID ?? -1) -> \(info.pid)，重启录音")
-                    stopRecording(reason: "目标进程变化")
-                    appWantedPID = info.pid
-                    reevaluate()
-                }
-            } else if appWants {
-                appIdleTicks += 1
-                if appIdleTicks >= 2 {
-                    trlog(.info, "APP", "应用音频已结束（连续 \(appIdleTicks) 次未检测到输入音频）")
-                    appWants = false
-                    appWantedPID = nil
-                    appIdleTicks = 0
-                    reevaluate()
-                }
-            }
+        // The trigger itself is event-driven (see AudioUseWatcher). This only guards
+        // against the tapped application disappearing without an end signal.
+        if appWants, let pid = appWantedPID, !AppProcessFinder.isAlive(pid) {
+            trlog(.warn, "APP", "目标进程 pid \(pid) 已退出，结束应用音频录音")
+            appWants = false
+            appWantedPID = nil
+            appIdleTicks = 0
+            reevaluate()
         }
 
         refreshAudioProcesses()
@@ -497,7 +573,8 @@ struct ContentView: View {
                     InfoRow(title: "通话", value: model.callStateText)
                     InfoRow(title: "CoreTelephony", value: model.coreTelephonyStatus)
                     InfoRow(title: "私有 tap", value: model.tapAvailability)
-                    InfoRow(title: "音频进程枚举", value: model.audioProcessStatus)
+                    InfoRow(title: "音频进程枚举(诊断)", value: model.audioProcessStatus)
+                    InfoRow(title: "应用音频监听", value: model.appAudioStatus)
                     InfoRow(title: "当前文件", value: model.currentFile)
                     InfoRow(title: "时长", value: String(format: "%.1f 秒", model.elapsed))
                     InfoRow(title: "音频包", value: "\(model.packets)")
@@ -527,6 +604,8 @@ struct ContentView: View {
                     TextField("应用 Bundle ID（逗号分隔）", text: $model.watchedBundleIDs)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
+                    Text("触发信号：音频中断 / 次要音频 / CallKit 通话。目标按 Bundle ID 匹配运行中的 App；未匹配到则回退到上面的手动目标。")
+                        .font(.caption2).foregroundColor(.secondary)
                     Toggle("音量键触发", isOn: Binding(get: { model.watchVolumeKeys },
                                                      set: { _ in model.toggleWatchVolumeKeys() }))
                     Toggle("按键不显示音量 HUD", isOn: $model.keySuppressesHUD)
@@ -611,6 +690,9 @@ struct ContentView: View {
                 Button("刷新") { model.library.refresh() }
             }
         }
+        // Installing the volume-key monitor needs a key window for its hidden
+        // MPVolumeView, so the triggers are assembled here rather than in init().
+        .onAppear { model.startEnabledTriggers() }
     }
 
     private func flags(for info: AudioProcessInfo) -> String {

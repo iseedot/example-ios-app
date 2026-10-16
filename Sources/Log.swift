@@ -80,21 +80,38 @@ final class Log {
         fileURL = url
     }
 
+    /// Writes the file line before returning.
+    ///
+    /// A trigger that crashes the process must still leave its own line on disk, so
+    /// the write cannot be deferred to another queue: if the process dies before the
+    /// block runs, the evidence is gone. Only DEBUG lines stay asynchronous, since
+    /// they are the high-frequency ones and never the last line before a crash.
     func write(_ level: LogLevel, _ category: String, _ message: String) {
         let memoryLine = "[\(Self.formatter.string(from: Date()))] [\(level.rawValue)] [\(category)] \(message)"
         let fileLine = "[\(Self.fileFormatter.string(from: Date()))] [\(level.rawValue)] [\(category)] \(message)\n"
 
-        queue.async {
+        let flush: () -> Void = {
             if self.handle == nil { self.openFile() }
             self.handle?.write(Data(fileLine.utf8))
+        }
 
-            DispatchQueue.main.async {
-                self.lines.insert(memoryLine, at: 0)
-                if self.lines.count > self.memoryLimit {
-                    self.lines.removeLast(self.lines.count - self.memoryLimit)
-                }
-                self.onAppend?(memoryLine)
+        if level == .debug {
+            queue.async(execute: flush)
+        } else {
+            queue.sync(execute: flush)
+        }
+
+        let appendMemory = {
+            self.lines.insert(memoryLine, at: 0)
+            if self.lines.count > self.memoryLimit {
+                self.lines.removeLast(self.lines.count - self.memoryLimit)
             }
+            self.onAppend?(memoryLine)
+        }
+        if Thread.isMainThread {
+            appendMemory()
+        } else {
+            DispatchQueue.main.async(execute: appendMemory)
         }
     }
 

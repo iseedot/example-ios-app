@@ -40,6 +40,11 @@ final class VolumeKeyMonitor {
 
     static var isSupported: Bool { true }
 
+    /// Set when the hidden MPVolumeView could not be installed yet, so the HUD
+    /// suppression is retried once the window exists instead of being given up on.
+    private var needsVolumeViewRetry = false
+    private var retryAttempts = 0
+
     func start(suppressHUD: Bool = true, restoreVolume: Bool = true) {
         guard !active else { return }
         active = true
@@ -58,7 +63,14 @@ final class VolumeKeyMonitor {
         if suppressVolumeHUD {
             installVolumeView()
         }
-        trlog(.info, "KEY", "音量键监听已启动（HUD 抑制=\(suppressVolumeHUD)，音量还原=\(restoreVolume)）")
+        trlog(.info, "KEY", "音量键监听已启动（HUD 抑制=\(suppressVolumeHUD)，音量还原=\(restoreVolume)，"
+              + "当前音量 \(String(format: "%.2f", session.outputVolume))）")
+    }
+
+    /// Called from the view when it appears: by then a key window exists.
+    func retryVolumeViewIfNeeded() {
+        guard active, needsVolumeViewRetry, suppressVolumeHUD else { return }
+        installVolumeView()
     }
 
     func stop() {
@@ -71,14 +83,23 @@ final class VolumeKeyMonitor {
     }
 
     private func installVolumeView() {
+        guard volumeView == nil else { return }
         guard let window = Self.frontmostWindow() else {
-            trlog(.warn, "KEY", "找不到窗口，音量 HUD 抑制可能不生效")
+            needsVolumeViewRetry = true
+            retryAttempts += 1
+            trlog(.warn, "KEY", "找不到窗口，音量 HUD 抑制暂不生效（第 \(retryAttempts) 次，1 秒后重试）")
+            if retryAttempts <= 5 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    self?.retryVolumeViewIfNeeded()
+                }
+            }
             return
         }
         let view = MPVolumeView(frame: CGRect(x: -2000, y: -2000, width: 200, height: 40))
         window.addSubview(view)
         volumeView = view
-        trlog(.debug, "KEY", "已安装隐藏 MPVolumeView（HUD 抑制）")
+        needsVolumeViewRetry = false
+        trlog(.info, "KEY", "已安装隐藏 MPVolumeView（音量 HUD 已抑制）")
     }
 
     static func frontmostWindow() -> UIWindow? {

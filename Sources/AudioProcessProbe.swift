@@ -1,16 +1,15 @@
 //
 //  AudioProcessProbe.swift
-//  MyCallRec — enumerate CoreAudio process objects to learn which process owns audio.
+//  MyCallRec — probe the CoreAudio HAL process-object list.
 //
-//  The iOS SDK does not expose the HAL process-object API, so everything here is
-//  resolved at runtime: the entry point through dlsym and the property selectors as
-//  four-character codes. Nothing depends on SDK declarations, and every failure is
-//  logged so the caller can fall back to a sysctl process listing.
+//  Result on the test device: the system object answers
+//  kAudioHardwareIllegalOperationError ('nope') for 'prco', so this API cannot
+//  enumerate audio processes here. The probe therefore stays as a *diagnostic*: it
+//  reports once, in readable form, and the caller stops treating it as a trigger.
+//  The analysed target does not use this API at all.
 //
-//  Why it matters:
-//    * it answers "which PID owns the call audio" without guessing;
-//    * it detects a non-CallKit app (for example WeChat) that is running input audio,
-//      which is what a recorder needs to start automatically.
+//  The iOS SDK does not expose the HAL process-object types, so the entry point is
+//  resolved with dlsym and the property selectors are four-character codes.
 //
 
 import Foundation
@@ -44,17 +43,24 @@ private typealias AudioObjectGetPropertyDataFn = @convention(c) (UInt32,
 enum AudioProcessProbe {
     private static let frameworkPath = "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
 
+    /// Reported once per launch; the UI and the log both read it.
+    private(set) static var statusDescription = "尚未探测"
+    private static var reportedFailure = false
+
+    /// Resolved on first use. No other static is touched from this initialiser: a
+    /// static initialiser that writes another static is easy to get subtly wrong, so
+    /// `processes()` is what records the reason instead.
     private static let getPropertyData: AudioObjectGetPropertyDataFn? = {
         // Load explicitly so the symbol is reachable even if nothing else pulled it in.
         dlopen(frameworkPath, RTLD_NOW)
         guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "AudioObjectGetPropertyData") else {
-            trlog(.warn, "AUDIO", "未找到 AudioObjectGetPropertyData 符号")
             return nil
         }
         return unsafeBitCast(symbol, to: AudioObjectGetPropertyDataFn.self)
     }()
 
-    private static let fourCC: (String) -> UInt32 = { code in
+    /// A function rather than a closure property so other static initialisers can call it.
+    private static func fourCC(_ code: String) -> UInt32 {
         code.unicodeScalars.reduce(UInt32(0)) { ($0 << 8) | UInt32($1.value & 0xFF) }
     }
 
@@ -71,9 +77,38 @@ enum AudioProcessProbe {
 
     static var isAvailable: Bool { getPropertyData != nil }
 
+    /// Known CoreAudio OSStatus four-character results, so the log is self-explaining.
+    private static let knownStatus: [UInt32: String] = [
+        fourCC("nope"): "kAudioHardwareIllegalOperationError",
+        fourCC("who?"): "kAudioHardwareUnknownPropertyError",
+        fourCC("obj!"): "kAudioHardwareBadObjectError",
+        fourCC("!siz"): "kAudioHardwareBadPropertySizeError",
+        fourCC("!dat"): "kAudioDeviceUnsupportedFormatError",
+        fourCC("unop"): "kAudioHardwareUnsupportedOperationError",
+        fourCC("stop"): "kAudioHardwareNotRunningError",
+        fourCC("what"): "kAudioHardwareUnspecifiedError",
+        fourCC("!hog"): "kAudioDevicePermissionsError",
+    ]
+
+    /// Renders an OSStatus so the reader does not have to decode it by hand.
+    static func describe(status: Int32) -> String {
+        let raw = UInt32(bitPattern: status)
+        let printable = raw >= 0x2020_2020 && raw <= 0x7E7E_7E7E
+        let text = String(bytes: [UInt8((raw >> 24) & 0xFF), UInt8((raw >> 16) & 0xFF),
+                                  UInt8((raw >> 8) & 0xFF), UInt8(raw & 0xFF)], encoding: .ascii)
+        var result = "\(status)"
+        if printable, let text { result += " ('\(text)')" }
+        if let name = knownStatus[raw] { result += " \(name)" }
+        return result
+    }
+
     /// Enumerates every CoreAudio process object. Failures are logged, not thrown.
     static func processes() -> [AudioProcessInfo] {
-        guard let getPropertyData else { return [] }
+        guard let getPropertyData else {
+            statusDescription = "不可用（dlsym AudioObjectGetPropertyData 失败）"
+            report("AudioObjectGetPropertyData 不可用：\(statusDescription)")
+            return []
+        }
 
         // The first call only reports the required size, so the data pointer stays nil.
         var size: UInt32 = 0
@@ -81,7 +116,8 @@ enum AudioProcessProbe {
             getPropertyData(systemObject, address, 0, nil, &size, nil)
         }
         guard size > 0 else {
-            trlog(.warn, "AUDIO", "音频进程列表为空 (status=\(status), size=\(size))")
+            statusDescription = "不可用（\(describe(status: status))）"
+            report("音频进程列表不可用 (status=\(describe(status: status)), size=0)")
             return []
         }
 
@@ -93,11 +129,25 @@ enum AudioProcessProbe {
             }
         }
         guard status == 0 else {
-            trlog(.warn, "AUDIO", "读取音频进程列表失败 (status=\(status))")
+            statusDescription = "读取失败（\(describe(status: status))）"
+            report("读取音频进程列表失败 (status=\(describe(status: status)))")
             return []
         }
 
-        return identifiers.compactMap { info(for: $0, using: getPropertyData) }
+        let result = identifiers.compactMap { info(for: $0, using: getPropertyData) }
+        statusDescription = "可用（\(result.count) 个进程）"
+        return result
+    }
+
+    /// Warns the first time, then drops to debug: the ticker calls this repeatedly and
+    /// a permanently unavailable API must not flood the log.
+    private static func report(_ message: String) {
+        if reportedFailure {
+            trlog(.debug, "AUDIO", message)
+        } else {
+            reportedFailure = true
+            trlog(.warn, "AUDIO", message)
+        }
     }
 
     private static func withAddress<T>(_ selector: UInt32, _ body: (UnsafeRawPointer) -> T) -> T {
@@ -160,7 +210,7 @@ enum AudioProcessProbe {
             .joined(separator: " ")
     }
 
-    /// Processes currently capturing audio. This is the set a call recorder taps.
+    /// Processes currently capturing audio. Empty when the API is unavailable.
     static func inputProcesses() -> [AudioProcessInfo] {
         processes().filter { $0.isRunningInput }
     }
