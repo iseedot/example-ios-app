@@ -145,6 +145,15 @@ final class VolumeKeyMonitor {
     private func sample() {
         guard active else { return }
 
+        // Once the real HID events are flowing, a derived volume press can only ever be a
+        // duplicate, so stop the 10 Hz poll instead of keeping it (and the CPU) awake.
+        if hidIsPrimary?() == true {
+            timer?.invalidate()
+            timer = nil
+            trlog(.info, "KEY", "IOHID 已生效，停止音量采样（省电）")
+            return
+        }
+
         let sessionValue = AVAudioSession.sharedInstance().outputVolume
         if lastSessionVolume < 0 { lastSessionVolume = sessionValue }
         if abs(sessionValue - lastSessionVolume) > 0.001 {

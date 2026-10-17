@@ -52,15 +52,19 @@ enum AppProcessFinder {
             lock.lock(); cache.removeValue(forKey: key); lock.unlock()
         }
 
-        // One process-table scan per lookup; the loops below both read this snapshot.
-        let candidates = runningAppProcesses()
-
-        for entry in candidates {
-            guard let bundleIdentifier = bundleIdentifier(forExecutable: entry.path),
-                  bundleIdentifier.lowercased() == key else { continue }
-            lock.lock(); cache[key] = entry.pid; lock.unlock()
-            trlog(.info, "APP", "\(identifier) -> pid \(entry.pid)（\(entry.path)）")
-            return entry.pid
+        // One process-table scan per lookup, from the shared snapshot; a miss rescans once
+        // in case the app started after the snapshot was taken.
+        var candidates = runningAppProcesses()
+        if let match = matchBundle(key, in: candidates) {
+            lock.lock(); cache[key] = match.pid; lock.unlock()
+            trlog(.info, "APP", "\(identifier) -> pid \(match.pid)（\(match.path)）")
+            return match.pid
+        }
+        candidates = runningAppProcesses(fresh: true)
+        if let match = matchBundle(key, in: candidates) {
+            lock.lock(); cache[key] = match.pid; lock.unlock()
+            trlog(.info, "APP", "\(identifier) -> pid \(match.pid)（\(match.path)）")
+            return match.pid
         }
 
         // Fallback: match the executable name against the alias table.
@@ -77,9 +81,20 @@ enum AppProcessFinder {
         return nil
     }
 
-    /// Every process whose executable lives inside an application bundle.
-    static func runningAppProcesses() -> [ProcessEntry] {
-        ProcessList.running().filter { $0.path.contains("/Bundle/Application/") && $0.path.contains(".app/") }
+    private static func matchBundle(_ key: String, in candidates: [ProcessEntry]) -> ProcessEntry? {
+        for entry in candidates {
+            guard let bundleIdentifier = bundleIdentifier(forExecutable: entry.path),
+                  bundleIdentifier.lowercased() == key else { continue }
+            return entry
+        }
+        return nil
+    }
+
+    /// Every process whose executable lives inside an application bundle. Uses the shared
+    /// short-lived snapshot so a lookup does not rescan the whole process table every time.
+    static func runningAppProcesses(fresh: Bool = false) -> [ProcessEntry] {
+        ProcessList.snapshot(maxAge: fresh ? 0 : 10)
+            .filter { $0.path.contains("/Bundle/Application/") && $0.path.contains(".app/") }
     }
 
     /// Same helper exposed for the diagnostics snapshot.

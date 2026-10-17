@@ -42,6 +42,32 @@ enum ProcessList {
         return []
     }
 
+    private static var cachedSnapshot: (at: Date, entries: [ProcessEntry])?
+    private static let cacheLock = NSLock()
+
+    /// A process-table snapshot reused for a short time.
+    ///
+    /// A full scan reads the whole KERN_PROC_ALL table and resolves every process's path
+    /// with proc_pidpath. Running that on the UI timer (it used to run every 3 s) keeps the
+    /// CPU busy indefinitely and heats the phone; the snapshot bounds it to about one scan
+    /// per 10 s and only when something actually asks.
+    static func snapshot(maxAge: TimeInterval = 10) -> [ProcessEntry] {
+        cacheLock.lock()
+        if maxAge > 0, let cachedSnapshot,
+           Date().timeIntervalSince(cachedSnapshot.at) < maxAge {
+            let entries = cachedSnapshot.entries
+            cacheLock.unlock()
+            return entries
+        }
+        cacheLock.unlock()
+
+        let entries = running()
+        cacheLock.lock()
+        cachedSnapshot = (Date(), entries)
+        cacheLock.unlock()
+        return entries
+    }
+
     private static func entry(for info: kinfo_proc) -> ProcessEntry? {
         let pid = info.kp_proc.p_pid
         guard pid > 0 else { return nil }

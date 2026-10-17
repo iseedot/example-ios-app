@@ -120,6 +120,8 @@ final class AppModel: ObservableObject {
     private var volumeMonitor: VolumeKeyMonitor?
     private var keepAlive: BackgroundKeepAlive?
     private var ticker: Timer?
+    /// Foreground/background observers that re-evaluate the keep-alive.
+    private var lifecycleTokens: [NSObjectProtocol] = []
     /// Guards `startEnabledTriggers`: the view calls it on every appearance.
     private var triggersStarted = false
 
@@ -229,6 +231,7 @@ final class AppModel: ObservableObject {
         if watchCalls { startCallWatcher() }
         if watchApps { startAudioUseWatcher(); startNowPlayingWatcher() }
         if watchVolumeKeys { installKeyMonitor() }
+        registerLifecycleObservers()
         updateKeepAlive()
     }
 
@@ -266,7 +269,8 @@ final class AppModel: ObservableObject {
     /// Refreshes the pid list shown in the UI. The HAL probe reports its own failure
     /// once; afterwards this stays at debug level so the three-second ticker cannot
     /// flood the log.
-    func refreshAudioProcesses() {
+    /// - Parameter force: rescan instead of reusing the short-lived process snapshot.
+    func refreshAudioProcesses(force: Bool = false) {
         let probed = AudioProcessProbe.processes()
         audioProcessStatus = AudioProcessProbe.statusDescription
         if !probed.isEmpty {
@@ -281,7 +285,7 @@ final class AppModel: ObservableObject {
         }
         // Fallback: the HAL probe cannot enumerate here, so the sysctl listing still
         // gives a usable PID list for manual selection and for the tap target.
-        let entries = ProcessList.interesting(from: ProcessList.running())
+        let entries = ProcessList.interesting(from: ProcessList.snapshot(maxAge: force ? 0 : 10))
         audioProcesses = entries.map {
             AudioProcessInfo(objectID: 0, pid: $0.pid, bundleIdentifier: $0.name,
                              isRunning: true, isRunningInput: false, isRunningOutput: false)
@@ -722,7 +726,10 @@ final class AppModel: ObservableObject {
     /// Keeps the process alive in the background while any trigger is enabled. Without it
     /// the app is suspended and no trigger can fire.
     func updateKeepAlive() {
-        let wanted = keepAliveInBackground && (watchCalls || watchApps || watchVolumeKeys)
+        // The keep-alive exists only to stop iOS suspending the app in the background, so
+        // it is not needed (and would only add heat) while the app is in the foreground.
+        let inBackground = UIApplication.shared.applicationState != .active
+        let wanted = keepAliveInBackground && inBackground && (watchCalls || watchApps || watchVolumeKeys)
         if wanted, keepAlive == nil {
             let alive = BackgroundKeepAlive()
             if alive.start() {
@@ -736,6 +743,18 @@ final class AppModel: ObservableObject {
 
     func applyKeepAliveSetting() {
         updateKeepAlive()
+    }
+
+    /// Re-evaluates the keep-alive on every foreground/background transition.
+    private func registerLifecycleObservers() {
+        guard lifecycleTokens.isEmpty else { return }
+        let center = NotificationCenter.default
+        for name in [UIApplication.didEnterBackgroundNotification,
+                     UIApplication.willEnterForegroundNotification] {
+            lifecycleTokens.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.updateKeepAlive()
+            })
+        }
     }
 
     private func handleVolumeCombo(_ description: String) {
@@ -823,7 +842,9 @@ final class AppModel: ObservableObject {
         guard tickCount % 3 == 0 else { return }
 
         // The trigger itself is event-driven (see AudioUseWatcher). This only guards
-        // against the tapped application disappearing without an end signal.
+        // against the tapped application disappearing without an end signal. The process
+        // table is deliberately NOT rescanned here: that used to run every 3 s and heated
+        // the phone. Use the 刷新音频进程 button when a fresh list is needed.
         if appWants, let pid = appWantedPID, !AppProcessFinder.isAlive(pid) {
             trlog(.warn, "APP", "目标进程 pid \(pid) 已退出，结束应用音频录音")
             appWants = false
@@ -831,8 +852,6 @@ final class AppModel: ObservableObject {
             appIdleTicks = 0
             reevaluate()
         }
-
-        refreshAudioProcesses()
     }
 
     /// Collects a full snapshot — entitlements, tap capability, audio process table and,
@@ -967,7 +986,7 @@ struct ContentView: View {
                 }
 
                 Section(header: Text("音频进程（\(model.audioProcesses.count)）")) {
-                    Button("刷新音频进程") { model.refreshAudioProcesses() }
+                    Button("刷新音频进程") { model.refreshAudioProcesses(force: true) }
                     ForEach(model.audioProcesses) { info in
                         VStack(alignment: .leading) {
                             Text("\(info.pid) · \(info.displayName)").font(.footnote)
