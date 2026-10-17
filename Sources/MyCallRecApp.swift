@@ -61,6 +61,15 @@ enum TargetChoice: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum RecordingFormat: String, CaseIterable, Identifiable {
+    case m4a = "m4a（AAC，体积小）"
+    case caf = "caf（无损 PCM，体积大）"
+
+    var id: String { rawValue }
+    var fileExtension: String { self == .m4a ? "m4a" : "caf" }
+    var compresses: Bool { self == .m4a }
+}
+
 enum RecordTrigger: String {
     case manual = "手动"
     case volumeKey = "物理按键"
@@ -106,6 +115,8 @@ final class AppModel: ObservableObject {
     /// volume buttons over on some builds, which stops the trigger working at all.
     @Published var keySuppressesHUD = false
     @Published var watchedBundleIDs = "com.tencent.xin"
+    /// m4a/AAC by default (small files); caf keeps the lossless PCM the tap delivers.
+    @Published var recordingFormat: RecordingFormat = .m4a
 
     let library = RecordingLibrary()
     /// Forwards the library's changes so a refresh or delete repaints the list even though
@@ -365,7 +376,7 @@ final class AppModel: ObservableObject {
             trlog(.info, "REC", "已在录音中，忽略来自「\(trigger.rawValue)」的启动请求")
             return
         }
-        let url = library.newRecordingURL(prefix: prefix)
+        let url = library.newRecordingURL(prefix: prefix, ext: recordingFormat.fileExtension)
         do {
             // The microphone sentinel is mono upstream (cli/call-recorder.mm); the call and
             // system taps are stereo. Asking for stereo from the microphone tap can come
@@ -381,7 +392,8 @@ final class AppModel: ObservableObject {
                   + "mode=\(session.mode.rawValue) "
                   + "outputs=\(outputs.isEmpty ? "-" : outputs) inputs=\(inputs.isEmpty ? "-" : inputs)")
             let created = try TapRecorder(target: target, sampleRate: 44100, channels: channels,
-                                          fileURL: url, bypassTap: bypassTap)
+                                          fileURL: url, bypassTap: bypassTap,
+                                          compress: recordingFormat.compresses)
             try created.start()
             recorder = created
             isRecording = true
@@ -400,7 +412,7 @@ final class AppModel: ObservableObject {
             trlog(.error, "REC", "开始录音失败（\(trigger.rawValue)）：\(error)")
             recorder = nil
             isRecording = false
-            if trigger == .volumeKey { VolumeKeyMonitor.feedback(pulses: 3) }
+            if trigger == .volumeKey { VolumeKeyMonitor.feedback(pulses: 3, interval: 0.12) }
         }
     }
 
@@ -778,14 +790,16 @@ final class AppModel: ObservableObject {
             autoMutedUntilSourcesEnd = true
             trlog(.info, "KEY", "按键停止录音（\(description)）")
             stopRecording(reason: "物理按键")
-            VolumeKeyMonitor.feedback(pulses: 2)
+            // Two slow pulses: same count as start, different rhythm.
+            VolumeKeyMonitor.feedback(pulses: 2, interval: 0.30)
         } else {
             manualWants = true
             manualTrigger = .volumeKey
             autoMutedUntilSourcesEnd = false
             trlog(.info, "KEY", "按键开始录音（\(description)），目标 \(effectiveTarget().label)")
             reevaluate()
-            VolumeKeyMonitor.feedback(pulses: 1)
+            // One pulse was easy to miss; two brisk pulses are clearly felt.
+            VolumeKeyMonitor.feedback(pulses: 2, interval: 0.12)
         }
     }
 
@@ -960,6 +974,11 @@ struct ContentView: View {
                     if model.targetChoice == .auto {
                         Text("默认：通话中抓通话音频，未通话时抓麦克风。上面的手动目标仅在未通话时生效。")
                             .font(.caption2).foregroundColor(.secondary)
+                    }
+                    Picker("录音格式", selection: $model.recordingFormat) {
+                        ForEach(RecordingFormat.allCases) { format in
+                            Text(format.rawValue).tag(format)
+                        }
                     }
                     Button(model.isRecording && model.currentFile != "-" ? "停止录制" : "开始录制") {
                         model.toggleManualRecording()

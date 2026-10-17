@@ -200,11 +200,13 @@ final class VolumeKeyMonitor {
         }
     }
 
-    /// Short vibration feedback. The screen shows nothing.
-    static func feedback(pulses: Int) {
+    /// Short vibration feedback. The screen shows nothing. The interval lets start and
+    /// stop use the same pulse count with a different rhythm, and lets a single pulse
+    /// become a more noticeable pair.
+    static func feedback(pulses: Int, interval: TimeInterval = 0.18) {
         guard pulses > 0 else { return }
         for index in 0..<pulses {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.18) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * interval) {
                 AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
             }
         }

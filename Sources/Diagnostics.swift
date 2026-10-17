@@ -114,7 +114,8 @@ enum Diagnostics {
         DispatchQueue.global(qos: .userInitiated).async {
             defer { finished.signal() }
             do {
-                let created = try TapRecorder(target: .systemAudio, sampleRate: 44100, channels: 2, fileURL: url)
+                let created = try TapRecorder(target: .systemAudio, sampleRate: 44100, channels: 2,
+                                              fileURL: url, compress: false)
                 try created.start()
                 recorder = created
                 Thread.sleep(forTimeInterval: seconds)

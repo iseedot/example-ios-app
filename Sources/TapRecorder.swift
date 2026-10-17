@@ -104,7 +104,10 @@ private func tr_implementation(of cls: AnyClass, _ name: String, classMethod: Bo
 /// Receives audio from a private tap and writes it to a CAF file.
 public final class TapRecorder {
     private var queue: AudioQueueRef?
-    private var file: AudioFileID?
+    /// ExtAudioFile owns the file writer and converts the queue's PCM to AAC for m4a.
+    private var extFile: ExtAudioFileRef?
+    /// True when the destination is m4a/AAC; false keeps the lossless CAF/PCM output.
+    private let compress: Bool
     private var buffers: [AudioQueueBufferRef] = []
     private var format = AudioStreamBasicDescription()
     /// The AVAudioFormat-derived description. Fully populated, unlike what the queue
@@ -181,10 +184,11 @@ public final class TapRecorder {
     }
 
     public init(target: TapTarget, sampleRate: Double, channels: UInt32,
-                fileURL: URL, bypassTap: Bool = false) throws {
+                fileURL: URL, bypassTap: Bool = false, compress: Bool = true) throws {
         destination = fileURL
         targetLabel = target.label
         self.bypassTap = bypassTap
+        self.compress = compress
 
         guard let requested = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                             sampleRate: sampleRate,
@@ -308,12 +312,6 @@ public final class TapRecorder {
             trlog(.warn, "TAP", "读不到队列的 StreamDescription，沿用请求格式")
         }
 
-        // Create the file from the fully populated request format, not from the queue's
-        // read-back. A partially filled ASBD makes AudioFileCreateWithURL fail with
-        // kAudioFileUnspecifiedError ('wht?'), which is exactly what the read-back
-        // produced. The read-back stays a diagnostic, and the packet maths below follow
-        // the format the file is actually written in.
-        var fileFormat = requestedFormat
         let destinationDirectory = destination.deletingLastPathComponent()
         if !FileManager.default.fileExists(atPath: destinationDirectory.path) {
             try? FileManager.default.createDirectory(at: destinationDirectory,
@@ -321,33 +319,51 @@ public final class TapRecorder {
             trlog(.warn, "TAP", "录音目录不存在，已创建：\(destinationDirectory.path)")
         }
         trlog(.info, "TAP", "写入目标：\(destination.path)")
-        trlog(.info, "TAP", "文件格式：\(Self.describe(fileFormat))")
 
-        var file: AudioFileID?
-        status = AudioFileCreateWithURL(destination as CFURL, kAudioFileCAFType, &fileFormat,
-                                        AudioFileFlags.eraseFile, &file)
-        if status != noErr {
-            trlog(.warn, "TAP", "用请求格式建文件失败：\(status) \(Self.fourCC(status))，改用显式 LPCM ASBD 重试")
-            var explicit = Self.explicitLinearPCM(sampleRate: fileFormat.mSampleRate,
-                                                  channels: fileFormat.mChannelsPerFrame)
-            status = AudioFileCreateWithURL(destination as CFURL, kAudioFileCAFType, &explicit,
-                                            AudioFileFlags.eraseFile, &file)
-            if status == noErr { fileFormat = explicit }
+        // ExtAudioFile converts the queue's PCM to AAC for m4a and writes it unchanged for
+        // CAF. The client format is the format the queue actually delivers.
+        var clientFormat = format
+        var fileFormat = clientFormat
+        var fileType: AudioFileTypeID = kAudioFileCAFType
+        if compress {
+            fileType = kAudioFileM4AType
+            fileFormat = Self.aacFormat(sampleRate: format.mSampleRate,
+                                        channels: format.mChannelsPerFrame)
         }
-        guard status == noErr, let file else {
-            trlog(.error, "TAP", "AudioFileCreateWithURL 失败：\(status) \(Self.fourCC(status))；"
-                  + "目录存在=\(FileManager.default.fileExists(atPath: destinationDirectory.path))；"
-                  + "格式=\(Self.describe(fileFormat))")
+        trlog(.info, "TAP", "文件格式（\(compress ? "m4a/AAC" : "caf/LPCM")）：\(Self.describe(fileFormat))")
+
+        var ref: ExtAudioFileRef?
+        status = ExtAudioFileCreateWithURL(destination as CFURL, fileType, &fileFormat, nil,
+                                           AudioFileFlags.eraseFile, &ref)
+        if status != noErr, compress {
+            trlog(.warn, "TAP", "m4a 创建失败：\(status) \(Self.fourCC(status))，回退为 CAF/LPCM")
+            fileType = kAudioFileCAFType
+            fileFormat = clientFormat
+            status = ExtAudioFileCreateWithURL(destination as CFURL, fileType, &fileFormat, nil,
+                                               AudioFileFlags.eraseFile, &ref)
+        }
+        guard status == noErr, let ref else {
+            trlog(.error, "TAP", "ExtAudioFileCreateWithURL 失败：\(status) \(Self.fourCC(status))；"
+                  + "目录存在=\(FileManager.default.fileExists(atPath: destinationDirectory.path))")
             AudioQueueDispose(queue, true)
             self.queue = nil
             throw TapRecorderError.fileCreationFailed(status)
         }
-        self.file = file
-        format = fileFormat
+        status = ExtAudioFileSetProperty(ref, kExtAudioFileProperty_ClientDataFormat,
+                                         UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
+                                         &clientFormat)
+        guard status == noErr else {
+            trlog(.error, "TAP", "ExtAudioFileSetProperty(ClientDataFormat) 失败：\(status) \(Self.fourCC(status))")
+            ExtAudioFileDispose(ref)
+            AudioQueueDispose(queue, true)
+            self.queue = nil
+            throw TapRecorderError.fileCreationFailed(status)
+        }
+        self.extFile = ref
 
         if format.mBytesPerPacket != requestedFormat.mBytesPerPacket {
-            trlog(.warn, "TAP", "写入格式与请求格式的 bytes-per-packet 不同"
-                  + "（\(format.mBytesPerPacket) vs \(requestedFormat.mBytesPerPacket)），以写入格式为准")
+            trlog(.warn, "TAP", "队列格式与请求格式的 bytes-per-packet 不同"
+                  + "（\(format.mBytesPerPacket) vs \(requestedFormat.mBytesPerPacket)）")
         }
 
         let bytesPerPacket = format.mBytesPerPacket != 0
@@ -388,18 +404,18 @@ public final class TapRecorder {
             trlog(.info, "TAP", "第一个音频缓冲区到达 (\(byteCount) 字节)")
         }
         updatePeak(from: buffer, byteCount: byteCount)
-        if byteCount > 0, let file {
-            let bytesPerPacket = format.mBytesPerPacket != 0
-                ? format.mBytesPerPacket
-                : max(1, format.mBytesPerFrame)
-            var packets = byteCount / bytesPerPacket
-            if packets > 0 {
-                let status = AudioFileWritePackets(file, false, byteCount, nil, packetIndex, &packets,
-                                                   buffer.pointee.mAudioData)
+        if byteCount > 0, let extFile {
+            let bytesPerFrame = max(1, format.mBytesPerFrame)
+            let frames = byteCount / bytesPerFrame
+            if frames > 0 {
+                let audioBuffer = AudioBuffer(mNumberChannels: format.mChannelsPerFrame,
+                                              mDataByteSize: byteCount,
+                                              mData: buffer.pointee.mAudioData)
+                var list = AudioBufferList(mNumberBuffers: 1, mBuffers: audioBuffer)
+                let status = ExtAudioFileWrite(extFile, frames, &list)
                 if status == noErr {
-                    packetIndex += Int64(packets)
                     lock.lock()
-                    storedPackets += UInt64(packets)
+                    storedPackets += UInt64(frames)
                     lock.unlock()
                 }
             }
@@ -451,9 +467,9 @@ public final class TapRecorder {
             AudioQueueDispose(queue, true)
             self.queue = nil
         }
-        if let file {
-            AudioFileClose(file)
-            self.file = nil
+        if let extFile {
+            ExtAudioFileDispose(extFile)
+            self.extFile = nil
         }
         buffers = []
         tap = nil
@@ -490,6 +506,18 @@ public final class TapRecorder {
         if format.mBytesPerPacket == 0 {
             format.mBytesPerPacket = format.mBytesPerFrame * format.mFramesPerPacket
         }
+        return format
+    }
+
+    /// AAC (m4a) output format for ExtAudioFile. AudioFormatGetProperty fills in the
+    /// derived fields that a bare mFormatID/mSampleRate/mChannelsPerFrame leaves at zero.
+    private static func aacFormat(sampleRate: Double, channels: UInt32) -> AudioStreamBasicDescription {
+        var format = AudioStreamBasicDescription()
+        format.mFormatID = kAudioFormatMPEG4AAC
+        format.mSampleRate = sampleRate > 0 ? sampleRate : 44100
+        format.mChannelsPerFrame = max(1, channels)
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        _ = AudioFormatGetProperty(kAudioFormatProperty_FormatInfo, 0, nil, &size, &format)
         return format
     }
 

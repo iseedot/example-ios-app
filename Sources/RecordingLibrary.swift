@@ -68,11 +68,11 @@ final class RecordingLibrary: ObservableObject {
         .sorted { $0.modified > $1.modified }
     }
 
-    func newRecordingURL(prefix: String) -> URL {
+    func newRecordingURL(prefix: String, ext: String = "caf") -> URL {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd-HHmmss"
         let stamp = formatter.string(from: Date())
-        return directory.appendingPathComponent("\(prefix)-\(stamp).caf")
+        return directory.appendingPathComponent("\(prefix)-\(stamp).\(ext)")
     }
 
     func delete(_ recording: Recording) {
