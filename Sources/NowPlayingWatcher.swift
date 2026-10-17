@@ -59,6 +59,7 @@ final class NowPlayingWatcher {
     private var setWants: SetWantsNowPlayingNotificationsFn?
     private var tokens: [NSObjectProtocol] = []
     private var current: Client?
+    private var lastEmitted: Client?
     private var loggedKeys = false
 
     private func symbol<T>(_ name: String, as type: T.Type) -> T? {
@@ -120,7 +121,12 @@ final class NowPlayingWatcher {
             trlog(.info, "APP", "正在播放音频的 App：\(client.displayName) [\(client.bundleIdentifier)] "
                   + "pid \(client.pid) playing=\(client.isPlaying)")
         }
-        onClientChanged?(client.isPlaying ? client : nil)
+        // MediaRemote can repeat the same payload; only report an actual change so the UI
+        // and the evaluator are not re-run for nothing.
+        let emitted = client.isPlaying ? client : nil
+        guard emitted != lastEmitted else { return }
+        lastEmitted = emitted
+        onClientChanged?(emitted)
     }
 
     /// Pulls a client out of the notification payload. MediaRemote puts the pid, the

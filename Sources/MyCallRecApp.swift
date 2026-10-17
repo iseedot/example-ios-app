@@ -19,6 +19,7 @@ import SwiftUI
 import UIKit
 import AVFoundation
 import AVFAudio
+import Combine
 
 @main
 struct MyCallRecApp: App {
@@ -107,6 +108,9 @@ final class AppModel: ObservableObject {
     @Published var watchedBundleIDs = "com.tencent.xin"
 
     let library = RecordingLibrary()
+    /// Forwards the library's changes so a refresh or delete repaints the list even though
+    /// the view observes only this model.
+    private var libraryObservation: AnyCancellable?
 
     private var recorder: TapRecorder?
     private var watcher: CallWatcher?
@@ -154,16 +158,25 @@ final class AppModel: ObservableObject {
     private var lastLoggedSecond = -1
     /// Process list as last written to the log, so an unchanged list is not repeated.
     private var lastProcessSummary = ""
+    /// Set when a log line was appended; the ticker copies the newest lines to the UI.
+    private var logNeedsRefresh = false
+    /// How many log lines the UI renders. The complete transcript stays in Log.
+    private static let logLineLimit = 80
 
     init() {
-        Log.shared.onAppend = { [weak self] line in
-            guard let self else { return }
-            self.logLines.insert(line, at: 0)
-            if self.logLines.count > 400 { self.logLines.removeLast(self.logLines.count - 400) }
+        libraryObservation = library.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+
+        // Do not push every line into SwiftUI state. Logging is continuous and each
+        // @Published change re-renders the whole list; the closure only marks the view
+        // stale, and the 1 s ticker copies the newest lines once per second.
+        Log.shared.onAppend = { [weak self] _ in
+            self?.logNeedsRefresh = true
         }
         // Seed from the lines written before this model existed: storage resolution and
         // the audio session are logged from the app's init.
-        logLines = Log.shared.lines
+        logLines = Array(Log.shared.lines.prefix(Self.logLineLimit))
 
         trlog(.info, "APP", "日志文件：\(Log.shared.logFileURL?.path ?? "不可用")")
         if let openError = Log.shared.openError {
@@ -628,10 +641,11 @@ final class AppModel: ObservableObject {
     private func handleNowPlaying(_ client: NowPlayingWatcher.Client?) {
         nowPlayingClient = client
         guard let client else {
-            nowPlayingStatus = "无"
+            if nowPlayingStatus != "无" { nowPlayingStatus = "无" }
             return
         }
-        nowPlayingStatus = "\(client.displayName) pid \(client.pid)"
+        let text = "\(client.displayName) pid \(client.pid)"
+        if nowPlayingStatus != text { nowPlayingStatus = text }
 
         // If a call is up but the target was not identified yet, the now-playing app is it.
         if watchApps, appWants, appWantedPID == nil, callActive || !activeAudioUseSignals.isEmpty {
@@ -776,7 +790,7 @@ final class AppModel: ObservableObject {
     }
 
     private func handle(_ event: CallEvent) {
-        callStateText = event.state.label
+        if callStateText != event.state.label { callStateText = event.state.label }
         if event.address != nil || event.displayName != nil || event.uniqueIdentifier != nil {
             latestCall = CallInfo(address: event.address,
                                   name: event.displayName,
@@ -816,6 +830,14 @@ final class AppModel: ObservableObject {
 
     private func tick() {
         tickCount += 1
+
+        // The log is written continuously; fold a whole second of appends into one UI
+        // update instead of re-rendering once per line.
+        if logNeedsRefresh {
+            logNeedsRefresh = false
+            let latest = Array(Log.shared.lines.prefix(Self.logLineLimit))
+            if latest != logLines { logLines = latest }
+        }
 
         // Every 30 s, so a "keys do nothing" report tells us whether IOHID ever delivered
         // anything and whether the sampler fallback is installed.
@@ -1049,7 +1071,7 @@ struct ContentView: View {
                         .font(.caption2).foregroundColor(.secondary)
                     Text("若 App 闪退，重新打开后「复制全部日志」里会带上崩溃原因（含异常名与调用栈）。")
                         .font(.caption2).foregroundColor(.secondary)
-                    ForEach(model.logLines, id: \.self) { line in
+                    ForEach(Array(model.logLines.enumerated()), id: \.offset) { _, line in
                         Text(line).font(.caption2).foregroundColor(.secondary)
                     }
                 }
