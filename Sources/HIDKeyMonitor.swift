@@ -172,6 +172,15 @@ final class HIDKeyMonitor {
     fileprivate func handle(event: UnsafeMutableRawPointer) {
         eventCount += 1
         let type = getType?(event) ?? 0
+        // Log the first events whatever their type, so a build where a volume key arrives
+        // as a different event type or usage is diagnosable from the log alone.
+        if eventCount <= 30 {
+            let page = getInteger?(event, kIOHIDEventFieldKeyboardUsagePage) ?? 0
+            let usage = getInteger?(event, kIOHIDEventFieldKeyboardUsage) ?? 0
+            let down = getInteger?(event, kIOHIDEventFieldKeyboardDown) ?? -1
+            trlog(.debug, "KEY", "IOHID 事件#\(eventCount) type=\(type) "
+                  + "page=0x\(String(page, radix: 16)) usage=0x\(String(usage, radix: 16)) down=\(down)")
+        }
         guard type == kIOHIDEventTypeKeyboard else { return }
 
         let usagePage = getInteger?(event, kIOHIDEventFieldKeyboardUsagePage) ?? 0

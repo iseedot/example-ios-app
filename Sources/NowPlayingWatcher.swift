@@ -147,9 +147,10 @@ final class NowPlayingWatcher {
                 if let text = rawValue as? String { display = text }
             }
         }
-        if !loggedKeys {
+        if !loggedKeys, !info.isEmpty {
             loggedKeys = true
-            trlog(.debug, "APP", "MediaRemote 通知 userInfo 键：\(info.keys.map { String(describing: $0) }.sorted())")
+            let pairs = info.map { "\($0.key)=\(String(describing: $0.value))" }.sorted()
+            trlog(.info, "APP", "MediaRemote 通知 userInfo：\(pairs.joined(separator: ", "))")
         }
 
         if pid == nil, !bundle.isEmpty {

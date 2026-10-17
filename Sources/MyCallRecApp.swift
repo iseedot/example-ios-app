@@ -193,6 +193,18 @@ final class AppModel: ObservableObject {
         trlog(.info, "CT", "CoreTelephony \(coreTelephonyStatus)")
         trlog(.info, "AUDIO", "CoreAudio 进程对象 API：\(audioProcessStatus)")
 
+        // Entitlements are the first thing to check when a tap or a key does nothing, and
+        // "复制全部日志" is the easiest way to get them off the device.
+        let entitlements = Diagnostics.entitlementReport()
+        var missing: [String] = []
+        for key in Diagnostics.expectedEntitlements {
+            let value = entitlements[key] ?? "未知"
+            if value == "缺失" { missing.append(key) }
+            trlog(.info, "ENT", "\(key) = \(value)")
+        }
+        trlog(.info, "ENT", "缺失 \(missing.count)/\(Diagnostics.expectedEntitlements.count)："
+              + (missing.isEmpty ? "无" : missing.joined(separator: ", ")))
+
         refreshAudioProcesses()
         startTicker()
     }
@@ -775,6 +787,15 @@ final class AppModel: ObservableObject {
 
     private func tick() {
         tickCount += 1
+
+        // Every 30 s, so a "keys do nothing" report tells us whether IOHID ever delivered
+        // anything and whether the sampler fallback is installed.
+        if watchVolumeKeys, tickCount % 30 == 0 {
+            let hid = hidMonitor
+            trlog(.info, "KEY", "按键状态：IOHID 事件 \(hid?.eventCount ?? 0) 个，"
+                  + "收到音量事件=\((hid?.hasReceivedVolumeEvent ?? false) ? "是" : "否")，"
+                  + "采样后备=\(volumeMonitor != nil ? "已安装" : "无")")
+        }
 
         if let running = recorder {
             elapsed = running.secondsRecorded
