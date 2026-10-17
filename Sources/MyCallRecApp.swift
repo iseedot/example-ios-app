@@ -101,9 +101,12 @@ final class AppModel: ObservableObject {
     @Published var watchCalls = true
     @Published var watchApps = true
     @Published var watchVolumeKeys = true
-    /// Activating a play-and-record session can disturb the app whose audio we tap,
-    /// so it is switchable: with the tap entitlements a session is not required.
-    @Published var activatesAudioSession = true
+    /// Activating a play-and-record session can disturb the app whose audio we tap, and an
+    /// active session is the prime suspect for a tap that never delivers. With
+    /// com.apple.coreaudio.CanRecordWithoutSessionActivation the tap does not need it, so
+    /// it defaults off and is only forced on when the user asks. A plain microphone
+    /// recording activates the session by itself.
+    @Published var activatesAudioSession = false
     /// Keeps a silent audio session busy so the app is not suspended while another app is
     /// in the foreground. Without it the triggers cannot fire in the background at all.
     @Published var keepAliveInBackground = true
@@ -259,7 +262,7 @@ final class AppModel: ObservableObject {
         updateKeepAlive()
     }
 
-    static func configureAudioSession(activate: Bool = true) {
+    static func configureAudioSession(activate: Bool = false) {
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playAndRecord, mode: .default,
@@ -385,6 +388,9 @@ final class AppModel: ObservableObject {
             // The microphone needs no private tap; the call and system targets do. The
             // plain path also follows a Bluetooth HFP input, which the tap queue did not.
             let bypassTap = (target == .microphone)
+            // A tap wants the session NOT active (CanRecordWithoutSessionActivation), a
+            // plain microphone recording needs it active.
+            Self.configureAudioSession(activate: target == .microphone || activatesAudioSession)
             let session = AVAudioSession.sharedInstance()
             let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
             let inputs = session.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
@@ -486,6 +492,8 @@ final class AppModel: ObservableObject {
         if !callWants, !appWants, !manualWants {
             autoMutedUntilSourcesEnd = false
         }
+        // The keep-alive is not needed while a recording is running.
+        updateKeepAlive()
     }
 
     /// The trigger that best describes why a recording is wanted right now.
@@ -764,7 +772,10 @@ final class AppModel: ObservableObject {
         // The keep-alive exists only to stop iOS suspending the app in the background, so
         // it is not needed (and would only add heat) while the app is in the foreground.
         let inBackground = UIApplication.shared.applicationState != .active
-        let wanted = keepAliveInBackground && inBackground && (watchCalls || watchApps || watchVolumeKeys)
+        // Redundant while a recording already keeps the process busy, and every extra audio
+        // client adds heat.
+        let wanted = keepAliveInBackground && inBackground && recorder == nil
+            && (watchCalls || watchApps || watchVolumeKeys)
         if wanted, keepAlive == nil {
             let alive = BackgroundKeepAlive()
             if alive.start() {
