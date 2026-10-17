@@ -141,6 +141,8 @@ final class AppModel: ObservableObject {
     private var hidMonitor: HIDKeyMonitor?
     private var volumeMonitor: VolumeKeyMonitor?
     private var keepAlive: BackgroundKeepAlive?
+    /// Preferred keep-alive: a background process assertion (no audio).
+    private var processAssertion: ProcessAssertion?
     private var ticker: Timer?
     /// Foreground/background observers that re-evaluate the keep-alive.
     private var lifecycleTokens: [NSObjectProtocol] = []
@@ -809,12 +811,24 @@ final class AppModel: ObservableObject {
         // client adds heat.
         let wanted = keepAliveInBackground && inBackground && recorder == nil
             && (watchCalls || watchApps || watchVolumeKeys)
-        if wanted, keepAlive == nil {
-            let alive = BackgroundKeepAlive()
-            if alive.start() {
-                keepAlive = alive
+
+        if wanted {
+            if processAssertion == nil, keepAlive == nil {
+                // Prefer a background process assertion: it keeps the process alive without
+                // keeping the audio hardware awake, which is what the silent loop costs. Fall
+                // back to the audio loop only if the assertion cannot be created.
+                let assertion = ProcessAssertion()
+                if assertion.acquire() {
+                    processAssertion = assertion
+                } else {
+                    trlog(.warn, "APP", "进程断言不可用（\(assertion.statusDetail)），改用近静音音频保活")
+                    let alive = BackgroundKeepAlive()
+                    if alive.start() { keepAlive = alive }
+                }
             }
-        } else if !wanted, keepAlive != nil {
+        } else if processAssertion != nil || keepAlive != nil {
+            processAssertion?.release()
+            processAssertion = nil
             keepAlive?.stop()
             keepAlive = nil
         }

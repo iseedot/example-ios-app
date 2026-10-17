@@ -33,6 +33,15 @@
 	<key>inter-app-audio</key>
 	<true/>
 
+	<!-- Background liveness: a process assertion keeps the app alive without audio.
+	     The analysed target carries exactly these. -->
+	<key>com.apple.multitasking.systemappassertions</key>
+	<true/>
+	<key>com.apple.multitasking.termination</key>
+	<true/>
+	<key>com.apple.assertiond.app-state-monitor</key>
+	<true/>
+
 	<!-- Telephone call state. -->
 	<key>com.apple.CommCenter.fine-grained</key>
 	<array>
