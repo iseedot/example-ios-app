@@ -830,10 +830,14 @@ final class AppModel: ObservableObject {
 
     private func tick() {
         tickCount += 1
+        // Nothing in the UI is visible while the app is in the background, so the view
+        // refresh and the periodic status line are skipped there. The recording counters
+        // and the target-liveness guard below still run.
+        let active = UIApplication.shared.applicationState == .active
 
         // The log is written continuously; fold a whole second of appends into one UI
         // update instead of re-rendering once per line.
-        if logNeedsRefresh {
+        if active, logNeedsRefresh {
             logNeedsRefresh = false
             let latest = Array(Log.shared.lines.prefix(Self.logLineLimit))
             if latest != logLines { logLines = latest }
@@ -841,7 +845,7 @@ final class AppModel: ObservableObject {
 
         // Every 30 s, so a "keys do nothing" report tells us whether IOHID ever delivered
         // anything and whether the sampler fallback is installed.
-        if watchVolumeKeys, tickCount % 30 == 0 {
+        if active, watchVolumeKeys, tickCount % 30 == 0 {
             let hid = hidMonitor
             trlog(.info, "KEY", "按键状态：IOHID 事件 \(hid?.eventCount ?? 0) 个，"
                   + "收到音量事件=\((hid?.hasReceivedVolumeEvent ?? false) ? "是" : "否")，"
