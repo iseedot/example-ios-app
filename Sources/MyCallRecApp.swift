@@ -1068,7 +1068,7 @@ struct ContentView: View {
                     Toggle("通话时自动静音麦克风", isOn: $model.autoMuteCallMic)
                     Text("接通后自动把上行麦克风静音，让对方听不到你（对应目标的 Uplink (Microphone) / setUplinkMuted:）。仅覆盖电话与 CallKit 通话；自建 VoIP、不走 CallKit 的 App 无法这样静音。实验功能，通话异常就关掉。")
                         .font(.caption2).foregroundColor(.secondary)
-                    Text("触发方式：同时按音量+ 与音量-（0.8 秒内先后按下即可），或音量-／音量+ 双击。开始震 1 下，停止震 2 下。")
+                    Text("触发方式：只认「同时按音量+ 与音量-」（0.8 秒内先后按下即可）。双击不再触发。开始=两声快震，停止=两声慢震。")
                         .font(.caption).foregroundColor(.secondary)
                     Toggle("隐藏桌面图标", isOn: Binding(get: { model.hideIcon },
                                                        set: { _ in model.toggleHideIcon() }))
