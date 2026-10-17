@@ -711,8 +711,8 @@ final class AppModel: ObservableObject {
     /// Builds the key-event path: the shared detector plus, when it exists, the real HID
     /// source, and the volume-delta fallback behind it.
     private func installKeyMonitor() {
-        if let volumeMonitor {
-            volumeMonitor.retryVolumeViewIfNeeded()
+        if hidMonitor != nil || volumeMonitor != nil {
+            volumeMonitor?.retryVolumeViewIfNeeded()
             return
         }
 
@@ -723,30 +723,29 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.handleVolumeCombo(description) }
         }
 
-        // Primary source: the real button transitions. Its presses are deduplicated
-        // against the fallback by the shared detector.
-        var hid: HIDKeyMonitor?
+        // Real HID events are the primary source. When they start, the volume-delta sampler
+        // is NOT installed at all. That sampler is a 10 Hz poll that otherwise runs the
+        // whole time the app is alive and keeps the CPU awake; it exists only as a fallback
+        // for builds where IOHID is unavailable, selected by turning 「使用 IOHID 真实按键事件」 off.
         if useHIDKeyEvents {
             let candidate = HIDKeyMonitor()
             candidate.onPress = { [weak detector] direction, source in
                 detector?.press(direction, source: source)
             }
             if candidate.start() {
-                hid = candidate
                 hidMonitor = candidate
+                keyStatus = "IOHID 事件"
+                trlog(.info, "KEY", "按键触发就绪：IOHID（不启动音量采样，避免常驻 10 Hz 轮询）")
+                return
             }
         }
 
-        // Fallback source: the volume-delta sampler. It stays installed so the trigger
-        // still works if the HID client never delivers an event; it goes quiet as soon as
-        // HID proves it is alive.
+        // Fallback: the volume-delta sampler, only when IOHID is unavailable.
         let monitor = VolumeKeyMonitor(detector: detector)
-        monitor.hidIsPrimary = { [weak hid] in hid?.hasReceivedVolumeEvent ?? false }
         monitor.start(suppressHUD: keySuppressesHUD, restoreVolume: true)
         volumeMonitor = monitor
-
-        keyStatus = hidMonitor == nil ? "音量采样后备（IOHID 不可用）" : "IOHID 事件 + 采样后备"
-        trlog(.info, "KEY", "按键触发就绪：真实事件源=\(hidMonitor != nil ? "IOHID" : "音量采样")")
+        keyStatus = "音量采样后备（IOHID 不可用）"
+        trlog(.info, "KEY", "按键触发就绪：音量采样（IOHID 不可用）")
     }
 
     private func stopKeyMonitor() {
