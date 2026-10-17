@@ -390,7 +390,9 @@ final class AppModel: ObservableObject {
             let inputs = session.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
             trlog(.info, "AUDIO", "录音前会话：category=\(session.category.rawValue) "
                   + "mode=\(session.mode.rawValue) "
-                  + "outputs=\(outputs.isEmpty ? "-" : outputs) inputs=\(inputs.isEmpty ? "-" : inputs)")
+                  + "outputs=\(outputs.isEmpty ? "-" : outputs) inputs=\(inputs.isEmpty ? "-" : inputs) "
+                  + "otherAudio=\(session.isOtherAudioPlaying) "
+                  + "secondaryHint=\(session.secondaryAudioShouldBeSilencedHint)")
             let created = try TapRecorder(target: target, sampleRate: 44100, channels: channels,
                                           fileURL: url, bypassTap: bypassTap,
                                           compress: recordingFormat.compresses)
@@ -406,7 +408,9 @@ final class AppModel: ObservableObject {
             recordingTargetSnapshot = target
             runningTriggerSnapshot = trigger
             activeCallInfo = latestCall
-            trlog(.info, "REC", "开始录音（\(trigger.rawValue)）target=\(target.label) 声道=\(channels)")
+            let lifecycle = UIApplication.shared.applicationState == .active ? "前台" : "后台"
+            trlog(.info, "REC", "开始录音（\(trigger.rawValue)）target=\(target.label) 声道=\(channels) "
+                  + "格式=\(recordingFormat.rawValue) 场景=\(lifecycle)")
             trlog(.info, "REC", "文件：\(url.path)")
         } catch {
             trlog(.error, "REC", "开始录音失败（\(trigger.rawValue)）：\(error)")
@@ -422,6 +426,11 @@ final class AppModel: ObservableObject {
         trlog(.info, "REC", String(format: "停止录音（%@）：%.2f 秒 / %llu 包 / 峰值 %.3f",
                                    reason, running.secondsRecorded, running.packetsWritten,
                                    running.maxPeakAmplitude))
+        // One line that carries everything needed to judge the result from the log alone.
+        trlog(.info, "REC", "录音结果：文件=\(running.fileURL.lastPathComponent) "
+              + "格式=\(recordingFormat.rawValue) 时长=\(String(format: "%.2f", running.secondsRecorded))s "
+              + "包=\(running.packetsWritten) 峰值=\(String(format: "%.3f", running.maxPeakAmplitude)) "
+              + "首缓冲=\(running.receivedFirstBuffer ? "是" : "否")")
         if running.packetsWritten == 0 {
             trlog(.error, "REC", "0 个音频包：多为权限不足或目标无音频（receivedFirstBuffer=\(running.receivedFirstBuffer)）")
         } else if running.maxPeakAmplitude < 0.0005 {
