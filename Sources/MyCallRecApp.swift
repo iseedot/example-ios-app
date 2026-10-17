@@ -77,26 +77,43 @@ enum RecordTrigger: String {
     case app = "应用音频"
 }
 
-/// Which tap a call is recorded from.
+/// What a recording captures: one private tap, or both sides of a call at once.
+enum CapturePlan: Equatable {
+    case single(TapTarget)
+    /// My side (microphone) and the other side (speaker tap) recorded together and merged.
+    /// This is what the analysed target does in mixer mode.
+    case callBothSides
+
+    var label: String {
+        switch self {
+        case .single(let target): return target.label
+        case .callBothSides: return "麦克风+扬声器（双路混音）"
+        }
+    }
+}
+
+/// Which capture a call uses.
 ///
-/// "System audio" was the first guess and it delivered buffers that were entirely
-/// silent (2026-10-17 18:53 call: 46 s, peak 0.000): the telephony downlink does not
-/// pass through the media mix the system sentinel samples. The analysed target carries
-/// separate sentinels for "my side" (microphone) and "other side" (speaker), so the call
-/// target is now a choice with the speaker as the default and the log's peak value as
-/// the criterion.
+/// Measured with the 2026-10-17 capture test and confirmed by listening to the files: the
+/// speaker tap (-2) carries the other party's voice while a call is up, the process tap on
+/// WeChat carries only its ringtone (0.87 at connect), the system mix carries nothing, and
+/// the microphone carries my side whenever a telephone call is not holding the input. The
+/// analysed target records the microphone and the speaker tap at the same time and mixes
+/// them ("Running in mixer mode"), so that is the default here.
 enum CallTapChoice: String, CaseIterable, Identifiable {
-    case speaker = "扬声器（对端声音）"
-    case microphone = "麦克风（本机声音）"
+    case both = "本机+对端（双路混音，推荐）"
+    case speaker = "只有对端（扬声器）"
+    case microphone = "只有本机（麦克风）"
     case systemAudio = "系统混音"
 
     var id: String { rawValue }
 
-    var target: TapTarget {
+    var plan: CapturePlan {
         switch self {
-        case .speaker: return .speaker
-        case .microphone: return .microphone
-        case .systemAudio: return .systemAudio
+        case .both: return .callBothSides
+        case .speaker: return .single(.speaker)
+        case .microphone: return .single(.microphone)
+        case .systemAudio: return .single(.systemAudio)
         }
     }
 }
@@ -148,7 +165,7 @@ final class AppModel: ObservableObject {
     /// m4a/AAC by default (small files); caf keeps the lossless PCM the tap delivers.
     @Published var recordingFormat: RecordingFormat = .m4a
     /// Tap used while a call is up: the downlink ("other side") by default.
-    @Published var callTapChoice: CallTapChoice = .speaker
+    @Published var callTapChoice: CallTapChoice = .both
     /// Poll the audio-session hint properties while a watched app is alive; the
     /// equivalent notifications cannot fire while this app's session stays deactivated.
     @Published var pollAppAudioHint = true
@@ -162,7 +179,8 @@ final class AppModel: ObservableObject {
     /// the view observes only this model.
     private var libraryObservation: AnyCancellable?
 
-    private var recorder: TapRecorder?
+    /// Whatever is recording now: one tap, or the two sides of a call.
+    private var recorder: (any RecordingEngine)?
     private var watcher: CallWatcher?
     private var audioUseWatcher: AudioUseWatcher?
     /// MediaRemote now-playing source, mirroring the analysed daemon's MediaRemote observers.
@@ -197,7 +215,7 @@ final class AppModel: ObservableObject {
     /// How the current manual recording started, for the log and the metadata sidecar.
     private var manualTrigger: RecordTrigger = .manual
     /// Set once the source has changed mid-recording, to avoid restart loops.
-    private var recordingTargetSnapshot: TapTarget?
+    private var recordingPlanSnapshot: CapturePlan?
     /// The trigger that started the current recording, for the log and the sidecar.
     private var runningTriggerSnapshot: RecordTrigger = .manual
     /// Call metadata captured with the recording, written to the sidecar on stop.
@@ -390,75 +408,87 @@ final class AppModel: ObservableObject {
     /// CallKit/VoIP call seen by AudioUseWatcher (WeChat and friends).
     var callActive: Bool { callWants || voipCallActive }
 
-    /// The target the next recording should use. This is the default rule the app is
-    /// meant to follow:
-    ///   * a call is up          -> the call audio (the tapped app for a VoIP call, the
-    ///                              chosen call tap for a telephony call)
-    ///   * no call               -> the microphone
-    /// A manual choice (targetChoice != .auto) only applies when no call is up, so
-    /// "automatic" behaves the way a call recorder is expected to.
-    func effectiveTarget() -> TapTarget {
-        // A telephony call is recorded from the call audio even when another app (WeChat) is
-        // running. Tapping the running app during a cellular call captures that app, not the
-        // call, and comes out silent. The system mix is not the call audio either: that
-        // target delivered nothing but silence for every call so far.
-        if callWants { return callTapChoice.target }
+    /// What the next recording should capture. This is the rule the app follows:
+    ///   * a call is up -> both sides of the call (see CallTapChoice)
+    ///   * no call      -> the manually chosen target, otherwise the microphone
+    func capturePlan() -> CapturePlan {
+        if callWants { return callTapChoice.plan }
         if appWants {
-            // A watched app is up: tap its own audio, which is where a VoIP call lives.
-            if let pid = appWantedPID { return .process(pid) }
-            // The signal came from somewhere we could not resolve; the call tap is a
-            // better guess than the microphone.
-            return callTapChoice.target
+            // A watched app is up. A process tap on it carries its media audio (the WeChat
+            // ringtone measured 0.87 while its conversation was in no such tap), so the call
+            // plan is used rather than the process itself.
+            return callTapChoice.plan
         }
-        if voipCallActive { return callTapChoice.target }
-        if let manual = manualTarget { return manual }
-        return .microphone
+        if voipCallActive { return callTapChoice.plan }
+        if let manual = manualTarget { return .single(manual) }
+        return .single(.microphone)
     }
 
-    private func startRecording(prefix: String, target: TapTarget, trigger: RecordTrigger) {
+    private func startRecording(prefix: String, plan: CapturePlan, trigger: RecordTrigger) {
         guard recorder == nil else {
             trlog(.info, "REC", "已在录音中，忽略来自「\(trigger.rawValue)」的启动请求")
             return
         }
-        let url = library.newRecordingURL(prefix: prefix, ext: recordingFormat.fileExtension)
+        let baseName = library.newBaseName(prefix: prefix)
+        // The session is never activated on the call path: an active play-and-record session
+        // is what made the microphone fail with '!pri' while a telephone call was up, and the
+        // analysed target's recorder runs without one (CanRecordWithoutSessionActivation).
+        // The manual switch stays as the escape hatch for a device whose microphone records
+        // silence while idle.
+        Self.configureAudioSession(activate: activatesAudioSession)
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        let inputs = session.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
+        trlog(.info, "AUDIO", "录音前会话：category=\(session.category.rawValue) "
+              + "mode=\(session.mode.rawValue) "
+              + "outputs=\(outputs.isEmpty ? "-" : outputs) inputs=\(inputs.isEmpty ? "-" : inputs) "
+              + "otherAudio=\(session.isOtherAudioPlaying) "
+              + "secondaryHint=\(session.secondaryAudioShouldBeSilencedHint)")
         do {
-            // The microphone sentinel is mono upstream (cli/call-recorder.mm); the call and
-            // system taps are stereo. Asking for stereo from the microphone tap can come
-            // back empty on some builds.
-            let channels: UInt32 = target == .microphone ? 1 : 2
-            // The microphone needs no private tap; the call and system targets do. The
-            // plain path also follows a Bluetooth HFP input, which the tap queue did not.
-            let bypassTap = (target == .microphone)
-            // A tap wants the session NOT active (CanRecordWithoutSessionActivation), a
-            // plain microphone recording needs it active.
-            Self.configureAudioSession(activate: target == .microphone || activatesAudioSession)
-            let session = AVAudioSession.sharedInstance()
-            let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
-            let inputs = session.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
-            trlog(.info, "AUDIO", "录音前会话：category=\(session.category.rawValue) "
-                  + "mode=\(session.mode.rawValue) "
-                  + "outputs=\(outputs.isEmpty ? "-" : outputs) inputs=\(inputs.isEmpty ? "-" : inputs) "
-                  + "otherAudio=\(session.isOtherAudioPlaying) "
-                  + "secondaryHint=\(session.secondaryAudioShouldBeSilencedHint)")
-            let created = try TapRecorder(target: target, sampleRate: 44100, channels: channels,
-                                          fileURL: url, bypassTap: bypassTap,
-                                          compress: recordingFormat.compresses)
-            try created.start()
-            recorder = created
+            let created: (engine: any RecordingEngine, fileURL: URL)
+            switch plan {
+            case .callBothSides:
+                let dual = try DualRecorder(directory: library.directory, baseName: baseName,
+                                            compress: true)
+                // The engine is gone from `recorder` by the time the mix finishes, so the
+                // callback reads its own state; the closure is cleared to break the cycle.
+                dual.onFinishedMerging = { [weak self] in
+                    Task { @MainActor in
+                        let state = dual.mergeState
+                        dual.onFinishedMerging = nil
+                        trlog(.info, "REC", "双路录音收尾：\(state)")
+                        self?.library.refresh()
+                    }
+                }
+                created = (dual, dual.fileURL)
+            case .single(let target):
+                // The microphone sentinel is mono upstream (cli/call-recorder.mm); the taps
+                // are stereo. Asking for stereo from the microphone can come back empty.
+                let channels: UInt32 = target == .microphone ? 1 : 2
+                let url = library.newRecordingURL(prefix: prefix, ext: recordingFormat.fileExtension)
+                let single = try TapRecorder(target: target, sampleRate: 44100, channels: channels,
+                                             fileURL: url,
+                                             bypassTap: target == .microphone,
+                                             compress: recordingFormat.compresses)
+                try single.start()
+                created = (single, url)
+            }
+            recorder = created.engine
             isRecording = true
             elapsed = 0
             packets = 0
             peak = 0
             maxPeak = 0
             lastLoggedSecond = -1
-            currentFile = url.lastPathComponent
-            recordingTargetSnapshot = target
+            currentFile = created.fileURL.lastPathComponent
+            recordingPlanSnapshot = plan
             runningTriggerSnapshot = trigger
             activeCallInfo = latestCall
             let lifecycle = UIApplication.shared.applicationState == .active ? "前台" : "后台"
-            trlog(.info, "REC", "开始录音（\(trigger.rawValue)）target=\(target.label) 声道=\(channels) "
-                  + "格式=\(recordingFormat.rawValue) 场景=\(lifecycle)")
-            trlog(.info, "REC", "文件：\(url.path)")
+            trlog(.info, "REC", "开始录音（\(trigger.rawValue)）目标=\(plan.label) "
+                  + "格式=\(plan == .callBothSides ? "m4a（双路混音，AAC）" : recordingFormat.rawValue) "
+                  + "场景=\(lifecycle)")
+            trlog(.info, "REC", "文件：\(created.fileURL.path)")
         } catch {
             trlog(.error, "REC", "开始录音失败（\(trigger.rawValue)）：\(error)")
             recorder = nil
@@ -491,7 +521,7 @@ final class AppModel: ObservableObject {
         // target, the call, and the measured quality. The analysed target keeps a manifest
         // for the same reason; this is the small version.
         let meta = RecordingMeta(trigger: runningTriggerSnapshot.rawValue,
-                                 target: recordingTargetSnapshot?.label ?? running.targetLabel,
+                                 target: recordingPlanSnapshot?.label ?? running.targetLabel,
                                  call: activeCallInfo,
                                  startedAt: running.startedAt,
                                  seconds: running.secondsRecorded,
@@ -502,7 +532,7 @@ final class AppModel: ObservableObject {
         recorder = nil
         isRecording = false
         currentFile = "-"
-        recordingTargetSnapshot = nil
+        recordingPlanSnapshot = nil
         runningTriggerSnapshot = .manual
         activeCallInfo = nil
         library.refresh()
@@ -519,13 +549,13 @@ final class AppModel: ObservableObject {
             wants = false
         }
 
-        let target = effectiveTarget()
+        let plan = capturePlan()
 
-        // A call can begin or end while a recording is already running. The tap target
-        // cannot change under a live queue, so the only correct move is to close the file
-        // and start a new one on the new target.
-        if wants, recorder != nil, let snapshot = recordingTargetSnapshot, snapshot != target {
-            trlog(.info, "REC", "录音目标变化 \(snapshot.label) -> \(target.label)，重开文件")
+        // A call can begin or end while a recording is already running. Its capture cannot
+        // change under a live queue, so the only correct move is to close the file and start
+        // a new one with the new plan.
+        if wants, recorder != nil, let snapshot = recordingPlanSnapshot, snapshot != plan {
+            trlog(.info, "REC", "录音目标变化 \(snapshot.label) -> \(plan.label)，重开文件")
             stopRecording(reason: "目标变化")
         }
 
@@ -533,7 +563,7 @@ final class AppModel: ObservableObject {
             let trigger = intendedTrigger()
             let prefix = trigger == .app ? "app"
                 : (trigger == .call ? "call" : (trigger == .volumeKey ? "key" : "rec"))
-            startRecording(prefix: prefix, target: target, trigger: trigger)
+            startRecording(prefix: prefix, plan: plan, trigger: trigger)
         } else if !wants, recorder != nil {
             stopRecording(reason: "来源全部结束")
         }
@@ -562,7 +592,7 @@ final class AppModel: ObservableObject {
             manualWants = true
             manualTrigger = .manual
             autoMutedUntilSourcesEnd = false
-            trlog(.info, "REC", "手动开始（目标 \(effectiveTarget().label)）")
+            trlog(.info, "REC", "手动开始（目标 \(capturePlan().label)）")
         }
         reevaluate()
     }
@@ -647,6 +677,12 @@ final class AppModel: ObservableObject {
     /// signals are generic, so they only start a recording when a watched app can actually
     /// be resolved — otherwise any app that plays a video would start one.
     private func handleAudioUse(_ event: AudioUseEvent) {
+        // The capture test owns the taps while it runs. Handling an event here would leave
+        // appWants set, and a recording would start the moment the test stops.
+        guard !probeRunning else {
+            trlog(.debug, "APP", "测试采集中，忽略应用音频事件")
+            return
+        }
         switch event {
         case .started(let kind, let detail):
             trlog(.info, "APP", "\(kind.rawValue)：开始（\(detail)）")
@@ -925,7 +961,7 @@ final class AppModel: ObservableObject {
             manualWants = true
             manualTrigger = .volumeKey
             autoMutedUntilSourcesEnd = false
-            trlog(.info, "KEY", "按键开始录音（\(description)），目标 \(effectiveTarget().label)")
+            trlog(.info, "KEY", "按键开始录音（\(description)），目标 \(capturePlan().label)")
             reevaluate()
             // One pulse was easy to miss; two brisk pulses are clearly felt.
             VolumeKeyMonitor.feedback(pulses: 2, interval: 0.12)
@@ -1035,6 +1071,16 @@ final class AppModel: ObservableObject {
     private func finishProbe(_ result: ProbeResult) {
         probeRunning = false
         probe = nil
+        // The capture test suppressed every trigger while it ran; drop the state those
+        // events left behind so nothing starts a recording on the way out.
+        appWants = false
+        appWantedPID = nil
+        appHintActive = false
+        appHintConfirmTicks = 0
+        appHintEndTicks = 0
+        callWants = false
+        manualWants = false
+        activeAudioUseSignals.removeAll()
         probeReportPath = result.url?.lastPathComponent ?? "-"
         probeStatus = "已完成（报告已复制到剪贴板）"
         UIPasteboard.general.string = Privacy.redact(result.text)
@@ -1253,7 +1299,7 @@ struct ContentView: View {
                     InfoRow(title: "正在播放音频", value: model.nowPlayingStatus)
                     InfoRow(title: "通话静音", value: model.callMuteStatus)
                     InfoRow(title: "按键", value: model.keyStatus)
-                    InfoRow(title: "当前目标", value: model.effectiveTarget().label)
+                    InfoRow(title: "当前目标", value: model.capturePlan().label)
                     InfoRow(title: "当前文件", value: model.currentFile)
                     InfoRow(title: "时长", value: String(format: "%.1f 秒", model.elapsed))
                     InfoRow(title: "音频包", value: "\(model.packets)")
@@ -1283,7 +1329,7 @@ struct ContentView: View {
                             Text(choice.rawValue).tag(choice)
                         }
                     }
-                    Text("电话的对方声音不走系统混音：默认抓「扬声器」这条路。三种都试一遍，日志「录音结果」里的峰值决定哪一种真的有声音（0.000 就是抓错了）。")
+                    Text("默认同时录「本机（麦克风）」和「对端（扬声器）」再混成一个文件——对方的声音不走系统混音，微信进程那一路只有铃声（实测 0.87）。混音结果出现在录音文件列表；混音失败时保留本机/对端两个文件。")
                         .font(.caption2).foregroundColor(.secondary)
                     Button(model.isRecording && model.currentFile != "-" ? "停止录制" : "开始录制") {
                         model.toggleManualRecording()
@@ -1329,7 +1375,7 @@ struct ContentView: View {
                                                           model.activatesAudioSession = newValue
                                                           model.applyAudioSessionSetting()
                                                       }))
-                    Text("通话或微信音频异常时再关掉。")
+                    Text("默认关闭，通话中必须保持关闭（否则电话会抢占麦克风）。只有空闲时麦克风录不到声音，才试着打开。")
                         .font(.caption).foregroundColor(.secondary)
                     Toggle("通话时自动静音麦克风", isOn: $model.autoMuteCallMic)
                     Text("接通后自动静音麦克风，仅对电话与 CallKit 通话有效；通话异常就关掉。")
@@ -1396,7 +1442,7 @@ struct ContentView: View {
                     if model.probeReportPath != "-" {
                         InfoRow(title: "报告", value: model.probeReportPath)
                     }
-                    Text("点开始后依次做：打电话 → 接听 → 说约 10 秒 → 挂断；然后微信语音通话 → 接通 → 说约 10 秒 → 挂断；最后点停止。期间每 2 秒自动换一个录音目标（扬声器 / 麦克风 / 微信进程 / 系统混音 / 音频服务），报告会列出哪个目标真的有声音，并给出这段时间系统广播过的信号。录音片段和报告都放在录音目录，报告也会自动复制到剪贴板。")
+                    Text("点开始后依次做：打电话 → 接听 → 说约 10 秒 → 挂断；然后微信语音通话 → 接通 → 说约 10 秒 → 挂断；最后点停止。期间每 2 秒自动换一种采集方式（双路混音 / 扬声器 / 麦克风 / 微信进程 / 系统混音），报告会列出哪一种真的有声音，并给出这段时间系统广播过的信号。录音片段和报告都在录音目录，报告也会自动复制到剪贴板。")
                         .font(.caption2).foregroundColor(.secondary)
                 }
 

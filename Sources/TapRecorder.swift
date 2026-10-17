@@ -102,7 +102,7 @@ private func tr_implementation(of cls: AnyClass, _ name: String, classMethod: Bo
 }
 
 /// Receives audio from a private tap and writes it to a CAF file.
-public final class TapRecorder {
+public final class TapRecorder: RecordingEngine {
     private var queue: AudioQueueRef?
     /// ExtAudioFile owns the file writer and converts the queue's PCM to AAC for m4a.
     private var extFile: ExtAudioFileRef?

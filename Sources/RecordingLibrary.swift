@@ -68,11 +68,16 @@ final class RecordingLibrary: ObservableObject {
         .sorted { $0.modified > $1.modified }
     }
 
-    func newRecordingURL(prefix: String, ext: String = "caf") -> URL {
+    /// Base name (no extension) for one recording. A dual recording needs it: its two
+    /// sides and its merged file all sit under the same name.
+    func newBaseName(prefix: String) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        let stamp = formatter.string(from: Date())
-        return directory.appendingPathComponent("\(prefix)-\(stamp).\(ext)")
+        return "\(prefix)-\(formatter.string(from: Date()))"
+    }
+
+    func newRecordingURL(prefix: String, ext: String = "caf") -> URL {
+        directory.appendingPathComponent("\(newBaseName(prefix: prefix)).\(ext)")
     }
 
     func delete(_ recording: Recording) {

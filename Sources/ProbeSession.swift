@@ -35,6 +35,8 @@ struct ProbeSample {
     let firstBuffer: Bool
     let queueFormat: String
     let tapDescription: String
+    /// Extra per-slice detail, e.g. each side's level for a dual slice.
+    let note: String?
     let error: String?
     let routeOut: String
     let routeIn: String
@@ -52,6 +54,19 @@ struct ProbeSample {
 struct ProbeResult {
     let text: String
     let url: URL?
+}
+
+/// One candidate capture for a slice.
+private enum ProbeCandidate: Equatable {
+    case single(TapTarget)
+    case dual
+
+    var label: String {
+        switch self {
+        case .single(let target): return target.label
+        case .dual: return "mic+speaker（双路）"
+        }
+    }
 }
 
 /// Everything measured while one slice was starting.
@@ -83,8 +98,10 @@ final class ProbeSession: NSObject, CXCallObserverDelegate {
     private var round = 1
     private var sliceInRound = 0
     private var slicesDone = 0
-    private var recorder: TapRecorder?
-    private var currentTarget: TapTarget = .speaker
+    private var recorder: (any RecordingEngine)?
+    /// Set during a dual slice, so the report can show what each side measured.
+    private var dualRecorder: DualRecorder?
+    private var currentCandidate: ProbeCandidate = .single(.speaker)
     private var currentChannels: UInt32 = 2
     private var sliceStarted = Date()
     private var context = ProbeContext(routeOut: "-", routeIn: "-", otherAudio: false, silenced: false,
@@ -193,31 +210,45 @@ final class ProbeSession: NSObject, CXCallObserverDelegate {
             stop()
             return
         }
-        let target = list[sliceInRound % list.count]
+        let candidate = list[sliceInRound % list.count]
         if sliceInRound > 0, sliceInRound % list.count == 0 { round += 1 }
         sliceInRound = sliceInRound % list.count
-        currentTarget = target
-        currentChannels = target == .microphone ? 1 : 2
+        currentCandidate = candidate
+        currentChannels = candidate == .single(.microphone) ? 1 : 2
         context = snapshotContext()
         sliceStarted = Date()
+        dualRecorder = nil
 
-        let name = "probe-\(stamp)-r\(round)s\(sliceInRound + 1)-\(fileLabel(target)).m4a"
+        let name = "probe-\(stamp)-r\(round)s\(sliceInRound + 1)-\(fileLabel(candidate)).m4a"
         let url = directory.appendingPathComponent(name)
-        trCreateRecordingSession(activate: target == .microphone)
+        // The session is never activated: production does not activate it either, and
+        // activation is what made the microphone fail while a telephone call was up.
+        trCreateRecordingSession(activate: false)
 
         do {
-            let created = try TapRecorder(target: target, sampleRate: 44100, channels: currentChannels,
-                                          fileURL: url, bypassTap: target == .microphone, compress: true)
-            try created.start()
+            let created: any RecordingEngine
+            switch candidate {
+            case .dual:
+                let dual = try DualRecorder(directory: directory,
+                                            baseName: "probe-\(stamp)-r\(round)s\(sliceInRound + 1)-dual",
+                                            compress: true)
+                dualRecorder = dual
+                created = dual
+            case .single(let target):
+                let single = try TapRecorder(target: target, sampleRate: 44100, channels: currentChannels,
+                                             fileURL: url, bypassTap: target == .microphone, compress: true)
+                try single.start()
+                created = single
+            }
             recorder = created
         } catch {
             // Record the failure as a sample: "this target cannot even be created" is a
             // result too, and the report has to distinguish it from "created, but silent".
             samples.append(ProbeSample(round: round, slice: sliceInRound + 1,
                                        offset: Date().timeIntervalSince(started),
-                                       target: target.label, channels: currentChannels,
+                                       target: candidate.label, channels: currentChannels,
                                        peak: 0, frames: 0, seconds: 0, firstBuffer: false,
-                                       queueFormat: "-", tapDescription: "-",
+                                       queueFormat: "-", tapDescription: "-", note: nil,
                                        error: "\(error)", routeOut: context.routeOut,
                                        routeIn: context.routeIn, otherAudio: context.otherAudio,
                                        silenced: context.silenced, callCount: context.callCount,
@@ -226,12 +257,12 @@ final class ProbeSession: NSObject, CXCallObserverDelegate {
                                        wechatPID: context.wechatPID,
                                        mediaServerPID: context.mediaServerPID,
                                        fileName: nil))
-            trlog(.error, "PROBE", "目标 \(target.label) 创建失败：\(error)")
+            trlog(.error, "PROBE", "目标 \(candidate.label) 创建失败：\(error)")
             reportStatus()
             return
         }
 
-        trlog(.info, "PROBE", "第 \(round) 轮第 \(sliceInRound + 1) 段：\(target.label) 声道=\(currentChannels) "
+        trlog(.info, "PROBE", "第 \(round) 轮第 \(sliceInRound + 1) 段：\(candidate.label) 声道=\(currentChannels) "
               + "通话=\(context.callCount.map(String.init) ?? "-") CallKit=\(context.callKitCalls)/\(context.callKitConnected) "
               + "otherAudio=\(context.otherAudio) secondaryHint=\(context.silenced) "
               + "微信pid=\(context.wechatPID.map(String.init) ?? "-")")
@@ -242,14 +273,27 @@ final class ProbeSession: NSObject, CXCallObserverDelegate {
         guard let running = recorder else { return }
         recorder = nil
         running.stop()
+
+        // A dual slice has no single queue and no single format: report what each side
+        // measured instead, which is the whole point of running the two together.
+        var note: String?
+        if let dual = dualRecorder {
+            note = String(format: "本机=%.4f（%llu 包） 对端=%.4f（%llu 包）",
+                          dual.uplink?.maxPeakAmplitude ?? 0, dual.uplink?.packetsWritten ?? 0,
+                          dual.downlink?.maxPeakAmplitude ?? 0, dual.downlink?.packetsWritten ?? 0)
+        }
+        let detailEngine = dualRecorder?.downlink ?? (running as? TapRecorder)
+        dualRecorder = nil
+
         let sample = ProbeSample(round: round, slice: sliceInRound + 1,
                                  offset: Date().timeIntervalSince(started),
                                  target: running.targetLabel, channels: currentChannels,
                                  peak: running.maxPeakAmplitude, frames: running.packetsWritten,
                                  seconds: running.secondsRecorded,
                                  firstBuffer: running.receivedFirstBuffer,
-                                 queueFormat: running.queueFormatDescription,
-                                 tapDescription: running.tapDescriptionText,
+                                 queueFormat: detailEngine?.queueFormatDescription ?? "-",
+                                 tapDescription: detailEngine?.tapDescriptionText ?? "-",
+                                 note: note,
                                  error: nil, routeOut: context.routeOut, routeIn: context.routeIn,
                                  otherAudio: context.otherAudio, silenced: context.silenced,
                                  callCount: context.callCount, callKitCalls: context.callKitCalls,
@@ -257,31 +301,37 @@ final class ProbeSession: NSObject, CXCallObserverDelegate {
                                  wechatPID: context.wechatPID, mediaServerPID: context.mediaServerPID,
                                  fileName: running.fileURL.lastPathComponent)
         samples.append(sample)
-        trlog(.info, "PROBE", String(format: "段 %d 结果：%@ 峰值=%.4f 帧=%llu 首缓冲=%@ 格式=%@ 文件=%@",
+        trlog(.info, "PROBE", String(format: "段 %d 结果：%@ 峰值=%.4f 帧=%llu 首缓冲=%@ 格式=%@ 文件=%@ %@",
                                      samples.count, running.targetLabel, sample.peak, sample.frames,
                                      sample.firstBuffer ? "是" : "否", sample.queueFormat,
-                                     sample.fileName ?? "-"))
+                                     sample.fileName ?? "-", note ?? ""))
         reportStatus()
     }
 
     private func reportStatus() {
-        onStatus?("第 \(round) 轮 · \(currentTarget.label) · 已完成 \(samples.count) 段")
+        onStatus?("第 \(round) 轮 · \(currentCandidate.label) · 已完成 \(samples.count) 段")
     }
 
-    /// Candidate targets, in the order that answers the two open questions first: the
-    /// downlink ("other side") and the microphone, then the app process (WeChat), then the
-    /// system mix, then whatever owns the audio clients (mediaserverd).
-    private func candidates() -> [TapTarget] {
-        var list: [TapTarget] = [.speaker, .microphone]
+    /// Candidate captures, in the order that answers the questions first: the two sides
+    /// together (the analysed target's mixer mode), then each side alone, then the app
+    /// process (WeChat — measured to carry only its ringtone), then the system mix.
+    /// mediaserverd was dropped: its 'qtob' binding fails with -66675 on every attempt.
+    private func candidates() -> [ProbeCandidate] {
+        var list: [ProbeCandidate] = [.dual, .single(.speaker), .single(.microphone)]
         if let pid = weChatPID() {
-            list.append(.process(pid))
+            list.append(.single(.process(pid)))
         }
-        list.append(.systemAudio)
-        if let pid = mediaServerPID() {
-            list.append(.process(pid))
-        }
+        list.append(.single(.systemAudio))
         return list
     }
+
+    private func fileLabel(_ candidate: ProbeCandidate) -> String {
+        switch candidate {
+        case .dual: return "dual"
+        case .single(let target): return target.label.replacingOccurrences(of: ":", with: "_")
+        }
+    }
+
 
     private func weChatPID() -> Int32? {
         if Date().timeIntervalSince(cachedWeChatAt) < 15 { return cachedWeChatPID }
@@ -319,10 +369,6 @@ final class ProbeSession: NSObject, CXCallObserverDelegate {
                             callKitConnected: calls.filter { $0.hasConnected && !$0.hasEnded }.count,
                             wechatPID: weChatPID(),
                             mediaServerPID: mediaServerPID())
-    }
-
-    private func fileLabel(_ target: TapTarget) -> String {
-        target.label.replacingOccurrences(of: ":", with: "_")
     }
 
     // MARK: - Signals
@@ -408,6 +454,9 @@ final class ProbeSession: NSObject, CXCallObserverDelegate {
                                 sample.peak, sample.frames, (sample.firstBuffer ? "是" : "否") as NSString,
                                 sample.queueFormat as NSString, callText as NSString,
                                 callKit as NSString, hint as NSString, route))
+            if let note = sample.note {
+                lines.append("      双路：\(note)")
+            }
             if let error = sample.error {
                 lines.append("      创建失败: \(error)")
             }
