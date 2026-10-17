@@ -366,14 +366,18 @@ final class AppModel: ObservableObject {
     /// A manual choice (targetChoice != .auto) only applies when no call is up, so
     /// "automatic" behaves the way a call recorder is expected to.
     func effectiveTarget() -> TapTarget {
+        // A telephony call is recorded from the call audio even when another app (WeChat) is
+        // running. Tapping the running app during a cellular call captures that app, not the
+        // call, and comes out silent.
+        if callWants { return .systemAudio }
         if appWants {
-            // A watched app is up: tap its own audio, which is where the call audio lives.
+            // A watched app is up: tap its own audio, which is where a VoIP call lives.
             if let pid = appWantedPID { return .process(pid) }
             // The signal came from somewhere we could not resolve; the system mix is a
             // better guess than the microphone.
             return .systemAudio
         }
-        if callActive { return .systemAudio }
+        if voipCallActive { return .systemAudio }
         if let manual = manualTarget { return manual }
         return .microphone
     }
@@ -606,6 +610,13 @@ final class AppModel: ObservableObject {
         case .started(let kind, let detail):
             trlog(.info, "APP", "\(kind.rawValue)：开始（\(detail)）")
             guard watchApps else { return }
+            // A telephony call is already recorded from the call audio; an app-audio signal
+            // during it must not steal the tap target (this is what recorded WeChat instead
+            // of the call).
+            if callWants {
+                trlog(.info, "APP", "电话通话在录，忽略应用音频信号")
+                return
+            }
             appIdleTicks = 0
             autoMutedUntilSourcesEnd = false
             if kind == .callKit {
@@ -789,9 +800,11 @@ final class AppModel: ObservableObject {
     /// Keeps the process alive in the background while any trigger is enabled. Without it
     /// the app is suspended and no trigger can fire.
     func updateKeepAlive() {
-        // The keep-alive exists only to stop iOS suspending the app in the background, so
-        // it is not needed (and would only add heat) while the app is in the foreground.
-        let inBackground = UIApplication.shared.applicationState != .active
+        // The keep-alive exists only to stop iOS suspending the app in the background.
+        // The check must be ".background" and not "!= .active": at launch the app is briefly
+        // .inactive, and treating that as background started the audio loop, which then ran
+        // in the foreground too and kept the audio hardware awake (the idle heat).
+        let inBackground = UIApplication.shared.applicationState == .background
         // Redundant while a recording already keeps the process busy, and every extra audio
         // client adds heat.
         let wanted = keepAliveInBackground && inBackground && recorder == nil
@@ -815,8 +828,12 @@ final class AppModel: ObservableObject {
     private func registerLifecycleObservers() {
         guard lifecycleTokens.isEmpty else { return }
         let center = NotificationCenter.default
+        // didBecomeActive matters: on a cold launch the app goes .inactive -> .active without
+        // ever firing willEnterForeground, so without it the keep-alive was never stopped.
         for name in [UIApplication.didEnterBackgroundNotification,
-                     UIApplication.willEnterForegroundNotification] {
+                     UIApplication.willEnterForegroundNotification,
+                     UIApplication.didBecomeActiveNotification,
+                     UIApplication.willResignActiveNotification] {
             lifecycleTokens.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 self?.updateKeepAlive()
             })
