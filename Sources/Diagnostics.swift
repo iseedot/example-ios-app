@@ -156,11 +156,12 @@ enum Diagnostics {
             "build": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?",
             "bundleIdentifier": Bundle.main.bundleIdentifier ?? "?",
         ]
+        // The user-assigned device name ("X 的 iPhone") is deliberately NOT collected: it
+        // identifies the owner and is not needed to debug the recorder.
         payload["device"] = [
             "model": device.model,
             "systemName": device.systemName,
             "systemVersion": device.systemVersion,
-            "name": device.name,
         ]
 
         let session = AVAudioSession.sharedInstance()

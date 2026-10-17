@@ -27,10 +27,12 @@ enum IconVisibility {
         "com.apple.springboard.services",
     ]
 
+    // SpringBoardUI and SpringBoardFoundation must NOT be loaded from an app process: their
+    // initialisers raise NSInternalInconsistencyException ("This process should not be
+    // linking or loading SpringBoardUI.framework") and crash the app. Only SpringBoardServices
+    // is loaded, and if SBIconVisibilityService is not reachable the call is a no-op.
     private static let frameworkCandidates = [
         "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
-        "/System/Library/PrivateFrameworks/SpringBoardUI.framework/SpringBoardUI",
-        "/System/Library/PrivateFrameworks/SpringBoardFoundation.framework/SpringBoardFoundation",
     ]
 
     /// Sets this app's icon visibility. Returns a human-readable outcome for the log.

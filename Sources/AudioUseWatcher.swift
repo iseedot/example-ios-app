@@ -94,8 +94,10 @@ final class AudioUseWatcher: NSObject, CXCallObserverDelegate {
                                         object: session, queue: .main) { note in
             let raw = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? NSNumber)?.uintValue ?? 0
             let reason = AVAudioSession.RouteChangeReason(rawValue: raw)?.debugLabel ?? "raw=\(raw)"
+            // Port type only: the port name is the Bluetooth device's name, which is not
+            // needed for diagnosis and should not be written to a shareable log.
             let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
-                .map { "\($0.portType.rawValue)/\($0.portName)" }
+                .map { $0.portType.rawValue }
                 .joined(separator: ",")
             trlog(.debug, "APP", "音频路由变化：\(reason)；输出=\(outputs.isEmpty ? "-" : outputs)")
         })
