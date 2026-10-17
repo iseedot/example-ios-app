@@ -140,6 +140,12 @@ public final class TapRecorder {
     /// Set once the first non-empty buffer arrives; distinguishes "entitlement missing"
     /// from "target produced nothing".
     public private(set) var receivedFirstBuffer = false
+    /// The queue's actual StreamDescription as text, for the capture-test report: a slice
+    /// that produced nothing is only diagnosable together with the format it ran with.
+    public private(set) var queueFormatDescription = "-"
+    /// What the private tap description resolved to. The system cannot be asked what a tap
+    /// bound to, so this string is the only record of it.
+    public private(set) var tapDescriptionText = "-"
 
     public var packetsWritten: UInt64 {
         lock.lock(); defer { lock.unlock() }
@@ -243,7 +249,8 @@ public final class TapRecorder {
         }
         // The private class describes its resolved target, which is the one fact a silent
         // recording needs when the sentinel and the actual tap disagree.
-        trlog(.info, "TAP", "tap 描述：\(String(describing: description))")
+        tapDescriptionText = String(describing: description)
+        trlog(.info, "TAP", "tap 描述：\(tapDescriptionText)")
 
         guard let tapAllocIMP = tr_implementation(of: tapClass, "alloc", classMethod: true) else {
             throw TapRecorderError.tapCreationFailed
@@ -310,8 +317,10 @@ public final class TapRecorder {
         if AudioQueueGetProperty(queue, kAudioQueueProperty_StreamDescription, &actual, &actualSize) == noErr,
            actual.mSampleRate > 0, actual.mChannelsPerFrame > 0 {
             format = actual
-            trlog(.info, "TAP", "队列实际格式：\(Self.describe(format))")
+            queueFormatDescription = Self.describe(format)
+            trlog(.info, "TAP", "队列实际格式：\(queueFormatDescription)")
         } else {
+            queueFormatDescription = Self.describe(format)
             trlog(.warn, "TAP", "读不到队列的 StreamDescription，沿用请求格式")
         }
 

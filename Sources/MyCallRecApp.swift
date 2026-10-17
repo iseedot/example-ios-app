@@ -152,6 +152,10 @@ final class AppModel: ObservableObject {
     /// Poll the audio-session hint properties while a watched app is alive; the
     /// equivalent notifications cannot fire while this app's session stays deactivated.
     @Published var pollAppAudioHint = true
+    /// Capture test: every candidate tap target is measured in turn and reported.
+    @Published var probeRunning = false
+    @Published var probeStatus = "未开始"
+    @Published var probeReportPath = "-"
 
     let library = RecordingLibrary()
     /// Forwards the library's changes so a refresh or delete repaints the list even though
@@ -169,6 +173,8 @@ final class AppModel: ObservableObject {
     private var hidMonitor: HIDKeyMonitor?
     private var volumeMonitor: VolumeKeyMonitor?
     private var keepAlive: BackgroundKeepAlive?
+    /// The one-shot capture test, while it runs.
+    private var probe: ProbeSession?
     /// Preferred keep-alive: a background process assertion (no audio).
     private var processAssertion: ProcessAssertion?
     private var ticker: Timer?
@@ -307,25 +313,10 @@ final class AppModel: ObservableObject {
         updateKeepAlive()
     }
 
+    /// Kept as the app-side name for the shared implementation, so the normal recording
+    /// path and the capture test cannot drift apart (see AudioSessionConfig.swift).
     static func configureAudioSession(activate: Bool = false) {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playAndRecord, mode: .default,
-                                    options: [.mixWithOthers, .allowBluetooth, .defaultToSpeaker])
-            if activate {
-                try session.setActive(true)
-                trlog(.info, "AUDIO", "音频会话已激活：\(session.category.rawValue)")
-            } else {
-                // Rely on com.apple.coreaudio.CanRecordWithoutSessionActivation instead.
-                // Deactivate as well: an active play-and-record session coexists with
-                // the tap queue, and this switch is the lever if the tap refuses to
-                // build while the session is up.
-                try? session.setActive(false, options: [.notifyOthersOnDeactivation])
-                trlog(.info, "AUDIO", "音频会话已停用（仅设置分类），避免影响被录音的应用")
-            }
-        } catch {
-            trlog(.error, "AUDIO", "音频会话配置失败：\(error)")
-        }
+        trCreateRecordingSession(activate: activate)
     }
 
     // MARK: - Audio processes
@@ -519,6 +510,10 @@ final class AppModel: ObservableObject {
 
     /// Starts or stops the recorder so that it runs exactly while a source wants it.
     private func reevaluate() {
+        // The capture test drives its own taps and writes its own report; no trigger may
+        // take the tap or the file over while it runs.
+        if probeRunning { return }
+
         var wants = manualWants || callWants || appWants
         if autoMutedUntilSourcesEnd, !manualWants {
             wants = false
@@ -864,8 +859,11 @@ final class AppModel: ObservableObject {
         let inBackground = UIApplication.shared.applicationState == .background
         // Redundant while a recording already keeps the process busy, and every extra audio
         // client adds heat.
-        let wanted = keepAliveInBackground && inBackground && recorder == nil
-            && (watchCalls || watchApps || watchVolumeKeys)
+        // A running capture test is a reason to stay alive and has no recorder of its own
+        // (its slice recorders are separate), so it must not be treated as "already busy".
+        let busy = recorder != nil && !probeRunning
+        let wanted = keepAliveInBackground && inBackground && !busy
+            && (watchCalls || watchApps || watchVolumeKeys || probeRunning)
 
         if wanted {
             if processAssertion == nil, keepAlive == nil {
@@ -910,6 +908,11 @@ final class AppModel: ObservableObject {
     }
 
     private func handleVolumeCombo(_ description: String) {
+        // Stopping the capture test by accident would throw the test run away.
+        if probeRunning {
+            trlog(.info, "KEY", "测试采集中，忽略按键（\(description)）")
+            return
+        }
         if recorder != nil {
             // A key stop is authoritative: auto sources stay muted until they end once.
             manualWants = false
@@ -991,6 +994,55 @@ final class AppModel: ObservableObject {
         updateKeepAlive()
     }
 
+    // MARK: - Capture test
+
+    /// Starts the one-shot capture test: every candidate tap target is measured in turn,
+    /// the report names the one that actually carries the audio, and the same run records
+    /// which public signals the system broadcasts while a WeChat call connects and ends.
+    func startProbe() {
+        guard !probeRunning else { return }
+        if recorder != nil { stopRecording(reason: "开始测试采集") }
+        // The automatic sources would fight the probe for the tap; they stay off for its
+        // duration and are re-evaluated from the current events afterwards.
+        manualWants = false
+        appWants = false
+        appWantedPID = nil
+        callWants = false
+        autoMutedUntilSourcesEnd = false
+
+        let session = ProbeSession()
+        session.onStatus = { [weak self] text in
+            Task { @MainActor in self?.probeStatus = text }
+        }
+        session.onFinish = { [weak self] result in
+            Task { @MainActor in self?.finishProbe(result) }
+        }
+        probe = session
+        probeRunning = true
+        probeReportPath = "-"
+        probeStatus = "采集中…"
+        trlog(.info, "PROBE", "开始测试采集")
+        session.start(in: Storage.recordingsDirectory)
+        updateKeepAlive()
+    }
+
+    func stopProbe() {
+        guard probeRunning, let session = probe else { return }
+        probeStatus = "正在生成报告…"
+        session.stop()
+    }
+
+    private func finishProbe(_ result: ProbeResult) {
+        probeRunning = false
+        probe = nil
+        probeReportPath = result.url?.lastPathComponent ?? "-"
+        probeStatus = "已完成（报告已复制到剪贴板）"
+        UIPasteboard.general.string = Privacy.redact(result.text)
+        trlog(.info, "PROBE", "报告已复制到剪贴板：\(probeReportPath)")
+        library.refresh()
+        updateKeepAlive()
+    }
+
     /// Removes the application-audio source and reports why.
     private func endAppAudioSource(reason: String) {
         guard appWants else { return }
@@ -1016,6 +1068,9 @@ final class AppModel: ObservableObject {
 
     private func tick() {
         tickCount += 1
+        // The capture test reports itself (status line and log); the trigger machinery,
+        // the call watchdog, the hint poll and the process check all stand down for it.
+        if probeRunning { return }
         // Nothing in the UI is visible while the app is in the background, so the periodic
         // status line is skipped there. The recording counters and the target-liveness
         // guard below still run.
@@ -1329,6 +1384,20 @@ struct ContentView: View {
                     .onDelete { indexSet in
                         indexSet.map { model.library.recordings[$0] }.forEach(model.library.delete)
                     }
+                }
+
+                Section(header: Text("测试采集（一次性）")) {
+                    if model.probeRunning {
+                        Button("停止并生成报告") { model.stopProbe() }
+                    } else {
+                        Button("开始测试采集") { model.startProbe() }
+                    }
+                    InfoRow(title: "状态", value: model.probeStatus)
+                    if model.probeReportPath != "-" {
+                        InfoRow(title: "报告", value: model.probeReportPath)
+                    }
+                    Text("点开始后依次做：打电话 → 接听 → 说约 10 秒 → 挂断；然后微信语音通话 → 接通 → 说约 10 秒 → 挂断；最后点停止。期间每 2 秒自动换一个录音目标（扬声器 / 麦克风 / 微信进程 / 系统混音 / 音频服务），报告会列出哪个目标真的有声音，并给出这段时间系统广播过的信号。录音片段和报告都放在录音目录，报告也会自动复制到剪贴板。")
+                        .font(.caption2).foregroundColor(.secondary)
                 }
 
                 Section(header: Text("诊断")) {
