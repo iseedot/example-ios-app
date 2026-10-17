@@ -152,7 +152,7 @@ final class HIDKeyMonitor {
         client = created
 
         register(created, hidKeyEventCallback, Unmanaged.passUnretained(self).toOpaque(), nil)
-        schedule(created, CFRunLoopGetMain(), kCFRunLoopDefaultMode)
+        schedule(created, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         statusDetail = "已订阅 IOHID 事件"
         trlog(.info, "KEY", "IOHID 事件已订阅（真实按键事件优先，音量采样作后备）")
         return true
@@ -161,7 +161,7 @@ final class HIDKeyMonitor {
     func stop() {
         guard let client else { return }
         unregister?(client)
-        unschedule?(client, CFRunLoopGetMain(), kCFRunLoopDefaultMode)
+        unschedule?(client, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         self.client = nil
         volumeUpDown = false
         volumeDownDown = false
