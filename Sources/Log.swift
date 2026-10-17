@@ -3,9 +3,10 @@
 //  MyCallRec — structured, copyable logging.
 //
 //  Every line carries a level and a category so a device log alone is enough to
-//  diagnose a run. Lines are kept in memory for the UI and appended to
+//  diagnose a run. Lines are kept in memory for the copy action and appended to
 //  Documents/logs/MyCallRec.log, which is reachable through the Files app
-//  (UIFileSharingEnabled) and can be copied or shared from the app.
+//  (UIFileSharingEnabled) and can be copied or shared from the app. There is
+//  deliberately no on-screen log view: the transcript is copied, not read in place.
 //
 
 import Foundation
@@ -22,10 +23,7 @@ enum LogLevel: String {
 final class Log {
     static let shared = Log()
 
-    /// Called on the main queue for every appended line.
-    var onAppend: ((String) -> Void)?
-
-    /// Lines kept in memory for the UI and for copy/share.
+    /// Lines kept in memory for copy/share.
     private(set) var lines: [String] = []
 
     private let memoryLimit = 800
@@ -140,7 +138,6 @@ final class Log {
             if self.lines.count > self.memoryLimit {
                 self.lines.removeLast(self.lines.count - self.memoryLimit)
             }
-            self.onAppend?(memoryLine)
         }
         if Thread.isMainThread {
             appendMemory()

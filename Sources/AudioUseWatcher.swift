@@ -96,10 +96,16 @@ final class AudioUseWatcher: NSObject, CXCallObserverDelegate {
             let reason = AVAudioSession.RouteChangeReason(rawValue: raw)?.debugLabel ?? "raw=\(raw)"
             // Port type only: the port name is the Bluetooth device's name, which is not
             // needed for diagnosis and should not be written to a shareable log.
-            let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+            let session = AVAudioSession.sharedInstance()
+            let outputs = session.currentRoute.outputs
                 .map { $0.portType.rawValue }
                 .joined(separator: ",")
-            trlog(.debug, "APP", "音频路由变化：\(reason)；输出=\(outputs.isEmpty ? "-" : outputs)")
+            // The two hint properties are what the app-audio trigger can still read while
+            // this app's session stays deactivated; logging them on a route change is how
+            // a device run shows whether they track another app's call at all.
+            trlog(.debug, "APP", "音频路由变化：\(reason)；输出=\(outputs.isEmpty ? "-" : outputs)；"
+                  + "otherAudio=\(session.isOtherAudioPlaying) "
+                  + "secondaryHint=\(session.secondaryAudioShouldBeSilencedHint)")
         })
 
         tokens.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,

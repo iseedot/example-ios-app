@@ -33,6 +33,9 @@ enum AppProcessFinder {
     private static let lock = NSLock()
     private static var cache: [String: Int32] = [:]
     private static var plistReadFailed = false
+    /// Identifiers whose miss was already reported. The app-audio hint polls this lookup,
+    /// so an uninstalled or not-yet-running app must not write the same line every 2 s.
+    private static var loggedMisses: Set<String> = []
 
     /// True while the pid still names a live process.
     static func isAlive(_ pid: Int32) -> Bool {
@@ -77,7 +80,12 @@ enum AppProcessFinder {
             return entry.pid
         }
 
-        trlog(.warn, "APP", "未找到 \(identifier) 的运行进程（未读过 Info.plist=\(plistReadFailed)，候选 \(candidates.count) 个）")
+        lock.lock()
+        let firstMiss = loggedMisses.insert(key).inserted
+        lock.unlock()
+        if firstMiss {
+            trlog(.warn, "APP", "未找到 \(identifier) 的运行进程（未读过 Info.plist=\(plistReadFailed)，候选 \(candidates.count) 个）")
+        }
         return nil
     }
 

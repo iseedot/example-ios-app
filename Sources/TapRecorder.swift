@@ -241,6 +241,9 @@ public final class TapRecorder {
         guard let description else {
             throw TapRecorderError.tapCreationFailed
         }
+        // The private class describes its resolved target, which is the one fact a silent
+        // recording needs when the sentinel and the actual tap disagree.
+        trlog(.info, "TAP", "tap 描述：\(String(describing: description))")
 
         guard let tapAllocIMP = tr_implementation(of: tapClass, "alloc", classMethod: true) else {
             throw TapRecorderError.tapCreationFailed
@@ -255,7 +258,7 @@ public final class TapRecorder {
             throw TapRecorderError.tapCreationFailed
         }
         tap = tapObject
-        trlog(.info, "TAP", "ATAudioTap 已创建")
+        trlog(.info, "TAP", "ATAudioTap 已创建：\(String(describing: tapObject))")
     }
 
     public func start() throws {

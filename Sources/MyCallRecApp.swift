@@ -77,9 +77,32 @@ enum RecordTrigger: String {
     case app = "应用音频"
 }
 
+/// Which tap a call is recorded from.
+///
+/// "System audio" was the first guess and it delivered buffers that were entirely
+/// silent (2026-10-17 18:53 call: 46 s, peak 0.000): the telephony downlink does not
+/// pass through the media mix the system sentinel samples. The analysed target carries
+/// separate sentinels for "my side" (microphone) and "other side" (speaker), so the call
+/// target is now a choice with the speaker as the default and the log's peak value as
+/// the criterion.
+enum CallTapChoice: String, CaseIterable, Identifiable {
+    case speaker = "扬声器（对端声音）"
+    case microphone = "麦克风（本机声音）"
+    case systemAudio = "系统混音"
+
+    var id: String { rawValue }
+
+    var target: TapTarget {
+        switch self {
+        case .speaker: return .speaker
+        case .microphone: return .microphone
+        case .systemAudio: return .systemAudio
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var logLines: [String] = []
     @Published var isRecording = false
     @Published var currentFile: String = "-"
     @Published var elapsed: Double = 0
@@ -124,6 +147,11 @@ final class AppModel: ObservableObject {
     @Published var callMuteStatus = "-"
     /// m4a/AAC by default (small files); caf keeps the lossless PCM the tap delivers.
     @Published var recordingFormat: RecordingFormat = .m4a
+    /// Tap used while a call is up: the downlink ("other side") by default.
+    @Published var callTapChoice: CallTapChoice = .speaker
+    /// Poll the audio-session hint properties while a watched app is alive; the
+    /// equivalent notifications cannot fire while this app's session stays deactivated.
+    @Published var pollAppAudioHint = true
 
     let library = RecordingLibrary()
     /// Forwards the library's changes so a refresh or delete repaints the list even though
@@ -174,30 +202,29 @@ final class AppModel: ObservableObject {
     /// until they have all gone inactive once.
     private var autoMutedUntilSourcesEnd = false
     private var appIdleTicks = 0
+    /// Consecutive polls where CoreTelephony reported no call while a telephony
+    /// recording was running (watchdog in tick()).
+    private var telephonyIdleTicks = 0
+    /// Consecutive polls of the secondary-audio hint, in both directions.
+    private var appHintConfirmTicks = 0
+    private var appHintEndTicks = 0
+    /// Set while appWants was started by the hint poll rather than by a session signal.
+    private var appHintActive = false
+    /// Last logged hint values, so only a transition is written.
+    private var lastAppHint: String?
+    /// No pid lookup before this instant: a miss rescans the process table.
+    private var hintNextResolveAt = Date.distantPast
     private var tickCount = 0
     private var lastLoggedSecond = -1
     /// Process list as last written to the log, so an unchanged list is not repeated.
     private var lastProcessSummary = ""
-    /// Set when a log line was appended; the ticker copies the newest lines to the UI.
-    private var logNeedsRefresh = false
-    /// How many log lines the UI renders. The complete transcript stays in Log.
-    private static let logLineLimit = 80
-
     init() {
         libraryObservation = library.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
 
-        // Do not push every line into SwiftUI state. Logging is continuous and each
-        // @Published change re-renders the whole list; the closure only marks the view
-        // stale, and the 1 s ticker copies the newest lines once per second.
-        Log.shared.onAppend = { [weak self] _ in
-            self?.logNeedsRefresh = true
-        }
-        // Seed from the lines written before this model existed: storage resolution and
-        // the audio session are logged from the app's init.
-        logLines = Array(Log.shared.lines.prefix(Self.logLineLimit))
-
+        // The run log is a file (and a copy/share action), not a view: nothing here
+        // mirrors it into SwiftUI state.
         trlog(.info, "APP", "日志文件：\(Log.shared.logFileURL?.path ?? "不可用")")
         if let openError = Log.shared.openError {
             trlog(.error, "APP", "日志文件不可写：\(openError)")
@@ -260,6 +287,18 @@ final class AppModel: ObservableObject {
         }
         triggersStarted = true
         trlog(.info, "APP", "装配触发源：通话=\(watchCalls) 应用=\(watchApps) 音量键=\(watchVolumeKeys)")
+
+        // Resolve the watched apps once at launch. Without this line a device log cannot
+        // tell "the trigger never fired" from "the bundle id never resolved to a pid".
+        if watchApps {
+            for identifier in watchedIdentifiers {
+                if let pid = AppProcessFinder.pid(forBundleIdentifier: identifier) {
+                    trlog(.info, "APP", "监听的应用 \(identifier) 正在运行：pid \(pid)")
+                } else {
+                    trlog(.info, "APP", "监听的应用 \(identifier) 当前未运行")
+                }
+            }
+        }
 
         if watchCalls { startCallWatcher() }
         if watchApps { startAudioUseWatcher(); startNowPlayingWatcher() }
@@ -363,23 +402,24 @@ final class AppModel: ObservableObject {
     /// The target the next recording should use. This is the default rule the app is
     /// meant to follow:
     ///   * a call is up          -> the call audio (the tapped app for a VoIP call, the
-    ///                              system mix for a telephony call)
+    ///                              chosen call tap for a telephony call)
     ///   * no call               -> the microphone
     /// A manual choice (targetChoice != .auto) only applies when no call is up, so
     /// "automatic" behaves the way a call recorder is expected to.
     func effectiveTarget() -> TapTarget {
         // A telephony call is recorded from the call audio even when another app (WeChat) is
         // running. Tapping the running app during a cellular call captures that app, not the
-        // call, and comes out silent.
-        if callWants { return .systemAudio }
+        // call, and comes out silent. The system mix is not the call audio either: that
+        // target delivered nothing but silence for every call so far.
+        if callWants { return callTapChoice.target }
         if appWants {
             // A watched app is up: tap its own audio, which is where a VoIP call lives.
             if let pid = appWantedPID { return .process(pid) }
-            // The signal came from somewhere we could not resolve; the system mix is a
+            // The signal came from somewhere we could not resolve; the call tap is a
             // better guess than the microphone.
-            return .systemAudio
+            return callTapChoice.target
         }
-        if voipCallActive { return .systemAudio }
+        if voipCallActive { return callTapChoice.target }
         if let manual = manualTarget { return manual }
         return .microphone
     }
@@ -450,7 +490,11 @@ final class AppModel: ObservableObject {
         if running.packetsWritten == 0 {
             trlog(.error, "REC", "0 个音频包：多为权限不足或目标无音频（receivedFirstBuffer=\(running.receivedFirstBuffer)）")
         } else if running.maxPeakAmplitude < 0.0005 {
-            trlog(.warn, "REC", "全程近乎静音（峰值 \(running.maxPeakAmplitude)）：tap 目标可能不对")
+            // A silent tap is a wrong target, not a failed recording. The call target is a
+            // choice, so name the next one to try instead of only warning.
+            let advice = activeCallInfo == nil ? ""
+                : "；这次通话用的是「\(callTapChoice.rawValue)」，换成另外两种之一再试"
+            trlog(.warn, "REC", "全程近乎静音（峰值 \(running.maxPeakAmplitude)）：tap 目标可能不对\(advice)")
         }
         // A sidecar next to the audio file records what produced it: the trigger, the tap
         // target, the call, and the measured quality. The analysed target keeps a manifest
@@ -621,6 +665,10 @@ final class AppModel: ObservableObject {
             }
             appIdleTicks = 0
             autoMutedUntilSourcesEnd = false
+            // A real session signal supersedes the hint poll, including its stop rule.
+            appHintActive = false
+            appHintEndTicks = 0
+            appHintConfirmTicks = 0
             if kind == .callKit {
                 voipCallActive = true
                 applyCallMute(true)
@@ -642,7 +690,7 @@ final class AppModel: ObservableObject {
                     activeAudioUseSignals.insert(kind.rawValue)
                     appWants = true
                     appWantedPID = nil
-                    trlog(.info, "APP", "CallKit 通话接通，但未匹配到 App：回退到系统音频")
+                    trlog(.info, "APP", "CallKit 通话接通，但未匹配到 App：回退到通话录音目标「\(callTapChoice.rawValue)」")
                     reevaluate()
                 } else {
                     trlog(.info, "APP", "\(kind.rawValue) 来自未监听的 App，且未匹配到 Bundle ID，忽略")
@@ -663,6 +711,13 @@ final class AppModel: ObservableObject {
             if kind == .callKit {
                 voipCallActive = false
                 applyCallMute(false)
+                // A cellular call is a CallKit call too. When CoreTelephony's disconnect
+                // notification never arrives, this end is the last independent evidence
+                // that the call is over; the live call count keeps a concurrent call safe.
+                let liveCount = watcher?.liveCallCount()
+                if liveCount == nil || liveCount == 0 {
+                    endTelephonyCall(reason: "CallKit 通话结束")
+                }
             }
             guard appWants, activeAudioUseSignals.isEmpty else { reevaluate(); return }
             appWants = false
@@ -768,7 +823,7 @@ final class AppModel: ObservableObject {
             }
             if candidate.start() {
                 hidMonitor = candidate
-                keyStatus = "IOHID 事件"
+                keyStatus = "已就绪"
                 trlog(.info, "KEY", "按键触发就绪：IOHID（不启动音量采样，避免常驻 10 Hz 轮询）")
                 return
             }
@@ -778,7 +833,7 @@ final class AppModel: ObservableObject {
         let monitor = VolumeKeyMonitor(detector: detector)
         monitor.start(suppressHUD: keySuppressesHUD, restoreVolume: true)
         volumeMonitor = monitor
-        keyStatus = "音量采样后备（IOHID 不可用）"
+        keyStatus = "已就绪（备用）"
         trlog(.info, "KEY", "按键触发就绪：音量采样（IOHID 不可用）")
     }
 
@@ -900,12 +955,53 @@ final class AppModel: ObservableObject {
         }
 
         let ended = event.state.isTerminal || (event.state == .unknown && event.activeCallCount == 0)
-        if ended, callWants {
-            callWants = false
-            trlog(.info, "CT", "通话结束，移除通话录音来源")
-            applyCallMute(false)
-            reevaluate()
+        if ended {
+            endTelephonyCall(reason: "CoreTelephony \(event.state.label)")
         }
+    }
+
+    /// Ends the telephony source, whichever signal noticed it.
+    ///
+    /// One signal is not enough: on 2026-10-17 CallKit reported the call end at 18:53:35
+    /// while no CoreTelephony status or identification notification arrived at all, and
+    /// the recording kept running for another 33 s until the volume combo stopped it. The
+    /// callers are therefore CallKit's end, the terminal CoreTelephony state, and the
+    /// watchdog poll of CTGetCurrentCallCount; the log names the one that fired.
+    private func endTelephonyCall(reason: String) {
+        guard callWants else { return }
+        callWants = false
+        telephonyIdleTicks = 0
+        // The finished call must not be attached to the next recording as its metadata.
+        latestCall = nil
+        trlog(.info, "CT", "通话结束（\(reason)），移除通话录音来源")
+        applyCallMute(false)
+        reevaluate()
+    }
+
+    /// Turns the hint poll on or off, and drops the source it started when it is turned
+    /// off: with the poll gone, nothing else would end that recording.
+    func setPollAppAudioHint(_ enabled: Bool) {
+        pollAppAudioHint = enabled
+        lastAppHint = nil
+        appHintConfirmTicks = 0
+        appHintEndTicks = 0
+        if !enabled, appHintActive {
+            endAppAudioSource(reason: "关闭了应用音频轮询")
+        }
+        updateKeepAlive()
+    }
+
+    /// Removes the application-audio source and reports why.
+    private func endAppAudioSource(reason: String) {
+        guard appWants else { return }
+        appWants = false
+        appWantedPID = nil
+        appIdleTicks = 0
+        appHintActive = false
+        appHintEndTicks = 0
+        appHintConfirmTicks = 0
+        trlog(.info, "APP", "结束应用音频来源（\(reason)）")
+        reevaluate()
     }
 
     // MARK: - Periodic evaluation
@@ -920,18 +1016,10 @@ final class AppModel: ObservableObject {
 
     private func tick() {
         tickCount += 1
-        // Nothing in the UI is visible while the app is in the background, so the view
-        // refresh and the periodic status line are skipped there. The recording counters
-        // and the target-liveness guard below still run.
+        // Nothing in the UI is visible while the app is in the background, so the periodic
+        // status line is skipped there. The recording counters and the target-liveness
+        // guard below still run.
         let active = UIApplication.shared.applicationState == .active
-
-        // The log is written continuously; fold a whole second of appends into one UI
-        // update instead of re-rendering once per line.
-        if active, logNeedsRefresh {
-            logNeedsRefresh = false
-            let latest = Array(Log.shared.lines.prefix(Self.logLineLimit))
-            if latest != logLines { logLines = latest }
-        }
 
         // Every 30 s, so a "keys do nothing" report tells us whether IOHID ever delivered
         // anything and whether the sampler fallback is installed.
@@ -955,6 +1043,26 @@ final class AppModel: ObservableObject {
             }
         }
 
+        // Two consecutive zero readings end a telephony recording, so one odd answer
+        // cannot cut a live call. Only while a telephony source is up: this is the only
+        // periodic CoreTelephony call in the app.
+        if callWants {
+            if let count = watcher?.liveCallCount() {
+                if count > 0 {
+                    telephonyIdleTicks = 0
+                } else {
+                    telephonyIdleTicks += 1
+                    if telephonyIdleTicks >= 2 {
+                        endTelephonyCall(reason: "CoreTelephony 报告 0 路通话（看门狗）")
+                    }
+                }
+            }
+        } else if telephonyIdleTicks != 0 {
+            telephonyIdleTicks = 0
+        }
+
+        if pollAppAudioHint, tickCount % 2 == 0 { pollAppAudioHintTick() }
+
         guard tickCount % 3 == 0 else { return }
 
         // The trigger itself is event-driven (see AudioUseWatcher). This only guards
@@ -962,12 +1070,71 @@ final class AppModel: ObservableObject {
         // table is deliberately NOT rescanned here: that used to run every 3 s and heated
         // the phone. Use the 刷新音频进程 button when a fresh list is needed.
         if appWants, let pid = appWantedPID, !AppProcessFinder.isAlive(pid) {
-            trlog(.warn, "APP", "目标进程 pid \(pid) 已退出，结束应用音频录音")
-            appWants = false
-            appWantedPID = nil
-            appIdleTicks = 0
-            reevaluate()
+            endAppAudioSource(reason: "目标进程 pid \(pid) 已退出")
         }
+    }
+
+    /// Polls the two audio-session properties that still answer while this app's session
+    /// is deactivated, so an application call can be noticed without a session of our own.
+    ///
+    /// Why a poll and not a notification: keeping the session deactivated is deliberate
+    /// (an active play-and-record session disturbs the app being recorded), and in that
+    /// state iOS never delivers AVAudioSession.interruptionNotification or
+    /// silenceSecondaryAudioHintNotification to this process — which is exactly why the
+    /// 2026-10-17 WeChat call produced no "应用音频" line at all. The properties
+    /// themselves are readable, so they are sampled instead.
+    ///
+    /// This is a heuristic: a watched app being resident plus another app holding
+    /// non-mixable audio can also mean a video is playing. Every transition is logged, so
+    /// one device run with a WeChat call says whether the hint tracks it.
+    private func pollAppAudioHintTick() {
+        // A telephony call is already recorded from the call tap, and a manual recording
+        // has a target of its own; neither may be taken over by a hint.
+        guard watchApps, !callWants, !manualWants else { return }
+
+        let session = AVAudioSession.sharedInstance()
+        let other = session.isOtherAudioPlaying
+        let silenced = session.secondaryAudioShouldBeSilencedHint
+        let summary = "otherAudio=\(other) secondaryHint=\(silenced)"
+        if summary != lastAppHint {
+            lastAppHint = summary
+            trlog(.info, "APP", "应用音频提示：\(summary)")
+        }
+
+        if appWants {
+            guard appHintActive else { return }
+            guard !silenced, activeAudioUseSignals.isEmpty else {
+                appHintEndTicks = 0
+                return
+            }
+            appHintEndTicks += 1
+            if appHintEndTicks >= 3 {
+                endAppAudioSource(reason: "次要音频提示已消失（轮询）")
+            }
+            return
+        }
+
+        guard silenced, activeAudioUseSignals.isEmpty else {
+            appHintConfirmTicks = 0
+            return
+        }
+        appHintConfirmTicks += 1
+        guard appHintConfirmTicks >= 2 else { return }
+        appHintConfirmTicks = 0
+
+        // Resolving the pid scans the process table on a miss, so a failed lookup backs
+        // off instead of rescanning on every poll.
+        guard Date() >= hintNextResolveAt else { return }
+        guard let pid = watchedAppPID() else {
+            hintNextResolveAt = Date().addingTimeInterval(15)
+            return
+        }
+        appHintActive = true
+        appWants = true
+        appWantedPID = pid
+        appHintEndTicks = 0
+        trlog(.info, "APP", "次要音频提示为真且监听的应用在运行，按 pid \(pid) 开始应用音频录音（轮询兜底）")
+        reevaluate()
     }
 
     /// Collects a full snapshot — entitlements, tap capability, audio process table and,
@@ -996,7 +1163,6 @@ final class AppModel: ObservableObject {
 
     func clearLog() {
         Log.shared.markSessionStart()
-        logLines.removeAll()
         trlog(.info, "APP", "日志已清空")
     }
 }
@@ -1031,7 +1197,7 @@ struct ContentView: View {
                     InfoRow(title: "应用音频监听", value: model.appAudioStatus)
                     InfoRow(title: "正在播放音频", value: model.nowPlayingStatus)
                     InfoRow(title: "通话静音", value: model.callMuteStatus)
-                    InfoRow(title: "按键事件源", value: model.keyStatus)
+                    InfoRow(title: "按键", value: model.keyStatus)
                     InfoRow(title: "当前目标", value: model.effectiveTarget().label)
                     InfoRow(title: "当前文件", value: model.currentFile)
                     InfoRow(title: "时长", value: String(format: "%.1f 秒", model.elapsed))
@@ -1057,6 +1223,13 @@ struct ContentView: View {
                             Text(format.rawValue).tag(format)
                         }
                     }
+                    Picker("通话录音目标", selection: $model.callTapChoice) {
+                        ForEach(CallTapChoice.allCases) { choice in
+                            Text(choice.rawValue).tag(choice)
+                        }
+                    }
+                    Text("电话的对方声音不走系统混音：默认抓「扬声器」这条路。三种都试一遍，日志「录音结果」里的峰值决定哪一种真的有声音（0.000 就是抓错了）。")
+                        .font(.caption2).foregroundColor(.secondary)
                     Button(model.isRecording && model.currentFile != "-" ? "停止录制" : "开始录制") {
                         model.toggleManualRecording()
                     }
@@ -1071,42 +1244,44 @@ struct ContentView: View {
                     TextField("应用 Bundle ID（逗号分隔）", text: $model.watchedBundleIDs)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
-                    Text("触发信号：CallKit 通话 / 音频中断 / 次要音频。CallKit 通话一定会触发；音频中断与次要音频只在能按 Bundle ID 匹配到监听的 App 时触发，避免任意 App 放音频就开始录。")
+                    Toggle("应用音频兜底轮询（实验）", isOn: Binding(get: { model.pollAppAudioHint },
+                                                                  set: { model.setPollAppAudioHint($0) }))
+                    Text("微信等不走系统通话的语音，需要这一项才能自动开始。已知代价：被监听的 App 留在后台时，播放视频也可能被当成通话开始录。")
                         .font(.caption2).foregroundColor(.secondary)
                     Toggle("音量键触发", isOn: Binding(get: { model.watchVolumeKeys },
                                                      set: { _ in model.toggleWatchVolumeKeys() }))
+                    Text("同时按音量+ 与音量- 开始/停止录音：开始两声快震，停止两声慢震。")
+                        .font(.caption2).foregroundColor(.secondary)
                     Toggle("后台保持存活", isOn: Binding(get: { model.keepAliveInBackground },
                                                      set: { newValue in
                                                          model.keepAliveInBackground = newValue
                                                          model.applyKeepAliveSetting()
                                                      }))
-                    Text("循环播放一段静音音频，避免切到其他 App 后本进程被挂起、收不到按键与通话事件。目标软件用守护进程达到同样效果。")
-                        .font(.caption2).foregroundColor(.secondary)
-                    Toggle("使用 IOHID 真实按键事件", isOn: Binding(get: { model.useHIDKeyEvents },
-                                                          set: { newValue in
-                                                              model.useHIDKeyEvents = newValue
-                                                              model.restartKeyMonitor()
-                                                          }))
-                    Text("优先订阅系统级真实按键事件（可识别同时按下的组合）。若某些系统上按键异常，可关掉改用音量采样。")
+                    Text("切到其他 App 后仍保持运行，否则收不到通话和按键事件。")
                         .font(.caption2).foregroundColor(.secondary)
                     Toggle("按键不显示音量 HUD", isOn: $model.keySuppressesHUD)
-                    Text("打开后会插入一个屏幕外的音量控件来压掉系统音量提示。若打开后音量键失去反应，请关掉它——那个控件会接管音量键。")
+                    Text("若打开后音量键失效，请关掉。")
+                        .font(.caption2).foregroundColor(.secondary)
+                    Toggle("备用按键方案", isOn: Binding(get: { !model.useHIDKeyEvents },
+                                                       set: { newValue in
+                                                               model.useHIDKeyEvents = !newValue
+                                                               model.restartKeyMonitor()
+                                                       }))
+                    Text("只在按键没反应时打开。")
                         .font(.caption2).foregroundColor(.secondary)
                     Toggle("激活音频会话", isOn: Binding(get: { model.activatesAudioSession },
                                                       set: { newValue in
                                                           model.activatesAudioSession = newValue
                                                           model.applyAudioSessionSetting()
                                                       }))
-                    Text("若录音时对方听不到你、或微信音频异常，把它关掉（依赖 CanRecordWithoutSessionActivation 权限）。")
+                    Text("通话或微信音频异常时再关掉。")
                         .font(.caption).foregroundColor(.secondary)
                     Toggle("通话时自动静音麦克风", isOn: $model.autoMuteCallMic)
-                    Text("接通后自动把上行麦克风静音，让对方听不到你（对应目标的 Uplink (Microphone) / setUplinkMuted:）。仅覆盖电话与 CallKit 通话；自建 VoIP、不走 CallKit 的 App 无法这样静音。实验功能，通话异常就关掉。")
+                    Text("接通后自动静音麦克风，仅对电话与 CallKit 通话有效；通话异常就关掉。")
                         .font(.caption2).foregroundColor(.secondary)
-                    Text("触发方式：只认「同时按音量+ 与音量-」（0.8 秒内先后按下即可）。双击不再触发。开始=两声快震，停止=两声慢震。")
-                        .font(.caption).foregroundColor(.secondary)
                     Toggle("隐藏桌面图标", isOn: Binding(get: { model.hideIcon },
                                                        set: { _ in model.toggleHideIcon() }))
-                    Text("实验功能：需要 SpringBoard 的图标状态接口。若设备上不支持，日志（ICON）会写明尝试过哪些入口且不会改动图标。恢复方式：Safari 打开 mycallrec:// 或从 TrollStore 列表启动。")
+                    Text("隐藏后从 Safari 打开 mycallrec:// 或 TrollStore 列表启动。")
                         .font(.caption).foregroundColor(.secondary)
                 }
 
@@ -1159,9 +1334,7 @@ struct ContentView: View {
                 Section(header: Text("诊断")) {
                     Button("自检并复制（含 3 秒 tap 测试）") { model.runDiagnostics(includeSelfTest: true) }
                     Button("仅复制状态（不做 tap 测试）") { model.runDiagnostics(includeSelfTest: false) }
-                    Text("快照包含：TrollStore 实际授予的 entitlements、私有 tap 选择子、CoreTelephony 结果、音频进程全表、音频会话状态，外加运行日志。粘贴给我即可。")
-                        .font(.caption2).foregroundColor(.secondary)
-                    Text("日志已脱敏：通话号码只保留后 4 位、不记录联系人名称、不记录设备名/蓝牙名称；不含 UDID/序列号/Apple ID。复制日志与诊断快照会再脱敏一次。")
+                    Text("快照包含权限、私有 tap、CoreTelephony、音频进程全表、音频会话状态与运行日志。")
                         .font(.caption2).foregroundColor(.secondary)
                 }
 
@@ -1172,13 +1345,8 @@ struct ContentView: View {
                         LogSharing.present(items: Log.shared.shareableFiles())
                     }
                     Button("清空日志") { model.clearLog() }
-                    Text("日志文件：\(Log.shared.logFileURL?.path ?? "不可用")")
+                    Text("日志已脱敏：不含通话号码、联系人名称与设备信息。App 闪退后重新打开，「复制全部日志」里会带上崩溃原因。")
                         .font(.caption2).foregroundColor(.secondary)
-                    Text("若 App 闪退，重新打开后「复制全部日志」里会带上崩溃原因（含异常名与调用栈）。")
-                        .font(.caption2).foregroundColor(.secondary)
-                    ForEach(Array(model.logLines.enumerated()), id: \.offset) { _, line in
-                        Text(line).font(.caption2).foregroundColor(.secondary)
-                    }
                 }
             }
             .listStyle(.grouped)

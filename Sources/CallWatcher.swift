@@ -228,6 +228,17 @@ public final class CallWatcher {
         return true
     }
 
+    /// Number of calls CoreTelephony reports right now, or nil when the symbol is absent.
+    ///
+    /// This is the watchdog source: on 2026-10-17 a call that CallKit had already ended
+    /// at 18:53:35 (CXCallObserver reported it) produced no terminal CoreTelephony
+    /// notification at all, so the recording ran on until it was stopped by hand 33 s
+    /// later. Notification delivery is not guaranteed, the live call count is.
+    public func liveCallCount() -> Int32? {
+        guard center != nil else { return nil }
+        return currentCallCount?()
+    }
+
     fileprivate func dispatch(name: CFNotificationName?, call: UnsafeMutableRawPointer?, payload: CFDictionary?) {
         // CFDictionary is toll-free bridged; go through AnyObject so the cast is unambiguous.
         let dictionary: [String: Any]? = {
