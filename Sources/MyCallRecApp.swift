@@ -118,6 +118,10 @@ final class AppModel: ObservableObject {
     /// volume buttons over on some builds, which stops the trigger working at all.
     @Published var keySuppressesHUD = false
     @Published var watchedBundleIDs = "com.tencent.xin"
+    /// Mute the call microphone automatically when a call is answered. Off by default: it
+    /// uses a private API, so it is opt-in and testable before being trusted.
+    @Published var autoMuteCallMic = false
+    @Published var callMuteStatus = "-"
     /// m4a/AAC by default (small files); caf keeps the lossless PCM the tap delivers.
     @Published var recordingFormat: RecordingFormat = .m4a
 
@@ -604,7 +608,10 @@ final class AppModel: ObservableObject {
             guard watchApps else { return }
             appIdleTicks = 0
             autoMutedUntilSourcesEnd = false
-            if kind == .callKit { voipCallActive = true }
+            if kind == .callKit {
+                voipCallActive = true
+                applyCallMute(true)
+            }
 
             // The configured Bundle ID match is the first try; the MediaRemote now-playing
             // app is the same second source the analysed daemon uses, so a call can be
@@ -640,7 +647,10 @@ final class AppModel: ObservableObject {
         case .ended(let kind, let detail):
             trlog(.info, "APP", "\(kind.rawValue)：结束（\(detail)）")
             activeAudioUseSignals.remove(kind.rawValue)
-            if kind == .callKit { voipCallActive = false }
+            if kind == .callKit {
+                voipCallActive = false
+                applyCallMute(false)
+            }
             guard appWants, activeAudioUseSignals.isEmpty else { reevaluate(); return }
             appWants = false
             appWantedPID = nil
@@ -696,6 +706,17 @@ final class AppModel: ObservableObject {
 
     func applyAudioSessionSetting() {
         Self.configureAudioSession(activate: activatesAudioSession)
+    }
+
+    /// Mutes or unmutes the call microphone, mirroring the analysed target's
+    /// TUCall -setUplinkMuted: ("Uplink (Microphone)").
+    private func applyCallMute(_ muted: Bool) {
+        guard autoMuteCallMic else { return }
+        if CallMicMute.setMuted(muted) {
+            callMuteStatus = muted ? "已自动静音" : "已取消静音"
+        } else if muted {
+            callMuteStatus = "静音失败（无 TUCall）"
+        }
     }
 
     func toggleWatchVolumeKeys() {
@@ -839,6 +860,7 @@ final class AppModel: ObservableObject {
         if event.state == .answered {
             callWants = true
             autoMutedUntilSourcesEnd = false
+            applyCallMute(true)
             reevaluate()
             return
         }
@@ -847,6 +869,7 @@ final class AppModel: ObservableObject {
         if ended, callWants {
             callWants = false
             trlog(.info, "CT", "通话结束，移除通话录音来源")
+            applyCallMute(false)
             reevaluate()
         }
     }
@@ -973,6 +996,7 @@ struct ContentView: View {
                     InfoRow(title: "音频进程枚举(诊断)", value: model.audioProcessStatus)
                     InfoRow(title: "应用音频监听", value: model.appAudioStatus)
                     InfoRow(title: "正在播放音频", value: model.nowPlayingStatus)
+                    InfoRow(title: "通话静音", value: model.callMuteStatus)
                     InfoRow(title: "按键事件源", value: model.keyStatus)
                     InfoRow(title: "当前目标", value: model.effectiveTarget().label)
                     InfoRow(title: "当前文件", value: model.currentFile)
@@ -1041,6 +1065,9 @@ struct ContentView: View {
                                                       }))
                     Text("若录音时对方听不到你、或微信音频异常，把它关掉（依赖 CanRecordWithoutSessionActivation 权限）。")
                         .font(.caption).foregroundColor(.secondary)
+                    Toggle("通话时自动静音麦克风", isOn: $model.autoMuteCallMic)
+                    Text("接通后自动把上行麦克风静音，让对方听不到你（对应目标的 Uplink (Microphone) / setUplinkMuted:）。仅覆盖电话与 CallKit 通话；自建 VoIP、不走 CallKit 的 App 无法这样静音。实验功能，通话异常就关掉。")
+                        .font(.caption2).foregroundColor(.secondary)
                     Text("触发方式：同时按音量+ 与音量-（0.8 秒内先后按下即可），或音量-／音量+ 双击。开始震 1 下，停止震 2 下。")
                         .font(.caption).foregroundColor(.secondary)
                     Toggle("隐藏桌面图标", isOn: Binding(get: { model.hideIcon },

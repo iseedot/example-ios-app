@@ -44,6 +44,10 @@
 	<array>
 		<string>access-calls</string>
 		<string>modify-calls</string>
+		<string>access-call-capabilities</string>
+		<string>modify-call-capabilities</string>
+		<string>access-call-providers</string>
+		<string>modify-status-bar</string>
 	</array>
 
 	<!-- Home screen icon visibility (Discreet mode). Present on the analyzed target's own
