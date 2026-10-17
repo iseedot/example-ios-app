@@ -354,7 +354,17 @@ final class AppModel: ObservableObject {
             // system taps are stereo. Asking for stereo from the microphone tap can come
             // back empty on some builds.
             let channels: UInt32 = target == .microphone ? 1 : 2
-            let created = try TapRecorder(target: target, sampleRate: 44100, channels: channels, fileURL: url)
+            // The microphone needs no private tap; the call and system targets do. The
+            // plain path also follows a Bluetooth HFP input, which the tap queue did not.
+            let bypassTap = (target == .microphone)
+            let session = AVAudioSession.sharedInstance()
+            let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+            let inputs = session.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
+            trlog(.info, "AUDIO", "录音前会话：category=\(session.category.rawValue) "
+                  + "mode=\(session.mode.rawValue) active=\(session.isActive) "
+                  + "outputs=\(outputs.isEmpty ? "-" : outputs) inputs=\(inputs.isEmpty ? "-" : inputs)")
+            let created = try TapRecorder(target: target, sampleRate: 44100, channels: channels,
+                                          fileURL: url, bypassTap: bypassTap)
             try created.start()
             recorder = created
             isRecording = true

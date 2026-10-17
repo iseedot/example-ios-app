@@ -119,6 +119,9 @@ public final class TapRecorder {
 
     /// Human-readable target ("system-audio", "pid:123", …) for the log and the sidecar.
     public let targetLabel: String
+    /// A plain microphone recording: the AudioQueue reads the default input device and the
+    /// private ATAudioTap / 'qtob' path is skipped entirely.
+    private let bypassTap: Bool
     /// When the recorder was created, for the metadata sidecar.
     public let startedAt = Date()
     /// Where the recording is written.
@@ -150,6 +153,23 @@ public final class TapRecorder {
         recorder.handle(buffer: buffer, queue: queue)
     }
 
+    /// Upstream watches kAudioQueueProperty_IsRunning: a tap queue can start in a
+    /// "waiting for device" state and only begin delivering once the route is ready. A
+    /// queue that stays at IsRunning=0 never calls back, which is exactly the 0-packet
+    /// case, so the state is logged.
+    private static let runningListener: AudioQueuePropertyListenerProc = { userData, queue, _ in
+        guard let userData else { return }
+        let recorder = Unmanaged<TapRecorder>.fromOpaque(userData).takeUnretainedValue()
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioQueueGetProperty(queue, kAudioQueueProperty_IsRunning, &running, &size)
+        recorder.reportRunning(status == noErr ? running : 0, status: status)
+    }
+
+    fileprivate func reportRunning(_ running: UInt32, status: OSStatus) {
+        trlog(.info, "TAP", "AudioQueue IsRunning=\(running)（status=\(status)）")
+    }
+
     /// Renders an OSStatus four-character result so a failure is readable in the log.
     static func fourCC(_ status: OSStatus) -> String {
         let raw = UInt32(bitPattern: status)
@@ -160,9 +180,11 @@ public final class TapRecorder {
         return "('\(text)')"
     }
 
-    public init(target: TapTarget, sampleRate: Double, channels: UInt32, fileURL: URL) throws {
+    public init(target: TapTarget, sampleRate: Double, channels: UInt32,
+                fileURL: URL, bypassTap: Bool = false) throws {
         destination = fileURL
         targetLabel = target.label
+        self.bypassTap = bypassTap
 
         guard let requested = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                             sampleRate: sampleRate,
@@ -173,6 +195,14 @@ public final class TapRecorder {
         self.format = requested.streamDescription.pointee
         self.requestedFormat = Self.normalized(self.format)
         trlog(.info, "TAP", "请求格式：\(Self.describe(self.format))")
+
+        // A plain microphone recording does not need the private tap. Skipping it avoids
+        // the tap queue entirely, which is what never delivers buffers here (notably with a
+        // Bluetooth HFP headset connected).
+        if bypassTap {
+            trlog(.info, "TAP", "麦克风直录模式：不使用私有 tap，AudioQueue 直接用默认输入设备")
+            return
+        }
 
         guard let descriptionClass = NSClassFromString("ATAudioTapDescription"),
               let tapClass = NSClassFromString("ATAudioTap") else {
@@ -226,32 +256,46 @@ public final class TapRecorder {
 
     public func start() throws {
         guard !isRunning else { return }
-        guard let tap else { throw TapRecorderError.tapCreationFailed }
+        if !bypassTap, tap == nil { throw TapRecorderError.tapCreationFailed }
 
         var queue: AudioQueueRef?
         // 0x800 is the flag the tap queues are created with upstream; a plain microphone
         // queue uses 0.
+        let flags: UInt32 = bypassTap ? 0 : kTapQueueFlags
         var status = AudioQueueNewInput(&format, TapRecorder.callback,
                                         Unmanaged.passUnretained(self).toOpaque(),
-                                        nil, nil, kTapQueueFlags, &queue)
+                                        nil, nil, flags, &queue)
         guard status == noErr, let queue else {
             trlog(.error, "TAP", "AudioQueueNewInput 失败：\(status) \(Self.fourCC(status))")
             throw TapRecorderError.queueSetupFailed(status)
         }
         self.queue = queue
-        trlog(.info, "TAP", "AudioQueueNewInput 成功（flags \(kTapQueueFlags)）")
+        trlog(.info, "TAP", "AudioQueueNewInput 成功（flags \(flags)）")
 
-        // Bind the queue input to the tap instead of the microphone. Upstream passes the
-        // tap pointer itself for an 8 byte payload.
-        let tapPointer = Unmanaged.passUnretained(tap).toOpaque()
-        status = AudioQueueSetProperty(queue, kTapOutputBypassProperty, tapPointer, 8)
-        guard status == noErr else {
-            trlog(.error, "TAP", "AudioQueueSetProperty('qtob') 失败：\(status) \(Self.fourCC(status))")
-            AudioQueueDispose(queue, true)
-            self.queue = nil
-            throw TapRecorderError.queueSetupFailed(status)
+        if bypassTap {
+            trlog(.info, "TAP", "直录模式：跳过 ATAudioTap / 'qtob' 绑定")
+        } else if let tap {
+            // Bind the queue input to the tap instead of the microphone. Upstream passes
+            // the tap pointer itself for an 8 byte payload.
+            let tapPointer = Unmanaged.passUnretained(tap).toOpaque()
+            status = AudioQueueSetProperty(queue, kTapOutputBypassProperty, tapPointer, 8)
+            guard status == noErr else {
+                trlog(.error, "TAP", "AudioQueueSetProperty('qtob') 失败：\(status) \(Self.fourCC(status))")
+                AudioQueueDispose(queue, true)
+                self.queue = nil
+                throw TapRecorderError.queueSetupFailed(status)
+            }
+            trlog(.info, "TAP", "AudioQueueSetProperty('qtob') 成功")
         }
-        trlog(.info, "TAP", "AudioQueueSetProperty('qtob') 成功")
+
+        // A tap queue can sit in "waiting for device"; log the state so a 0-packet run is
+        // distinguishable from a route that never became ready.
+        status = AudioQueueAddPropertyListener(queue, kAudioQueueProperty_IsRunning,
+                                               TapRecorder.runningListener,
+                                               Unmanaged.passUnretained(self).toOpaque())
+        if status == noErr {
+            trlog(.info, "TAP", "已添加 IsRunning 监听")
+        }
 
         // The queue may not give back what was requested, so adopt the real format.
         var actual = AudioStreamBasicDescription()
