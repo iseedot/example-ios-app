@@ -361,7 +361,7 @@ final class AppModel: ObservableObject {
             let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
             let inputs = session.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
             trlog(.info, "AUDIO", "录音前会话：category=\(session.category.rawValue) "
-                  + "mode=\(session.mode.rawValue) active=\(session.isActive) "
+                  + "mode=\(session.mode.rawValue) "
                   + "outputs=\(outputs.isEmpty ? "-" : outputs) inputs=\(inputs.isEmpty ? "-" : inputs)")
             let created = try TapRecorder(target: target, sampleRate: 44100, channels: channels,
                                           fileURL: url, bypassTap: bypassTap)
