@@ -84,6 +84,7 @@ final class AppModel: ObservableObject {
     @Published var tapAvailability: String = "未检测"
     @Published var audioProcessStatus: String = "未检测"
     @Published var appAudioStatus: String = "未安装"
+    @Published var nowPlayingStatus: String = "未监听"
     @Published var audioProcesses: [AudioProcessInfo] = []
     @Published var keyStatus: String = "未启用"
 
@@ -110,6 +111,9 @@ final class AppModel: ObservableObject {
     private var recorder: TapRecorder?
     private var watcher: CallWatcher?
     private var audioUseWatcher: AudioUseWatcher?
+    /// MediaRemote now-playing source, mirroring the analysed daemon's MediaRemote observers.
+    private var nowPlayingWatcher: NowPlayingWatcher?
+    private var nowPlayingClient: NowPlayingWatcher.Client?
     /// The shared gesture state machine, fed by both key-event sources.
     private let keyDetector = KeyComboDetector()
     private var hidMonitor: HIDKeyMonitor?
@@ -211,7 +215,7 @@ final class AppModel: ObservableObject {
         trlog(.info, "APP", "装配触发源：通话=\(watchCalls) 应用=\(watchApps) 音量键=\(watchVolumeKeys)")
 
         if watchCalls { startCallWatcher() }
-        if watchApps { startAudioUseWatcher() }
+        if watchApps { startAudioUseWatcher(); startNowPlayingWatcher() }
         if watchVolumeKeys { installKeyMonitor() }
         updateKeepAlive()
     }
@@ -484,6 +488,10 @@ final class AppModel: ObservableObject {
         } else {
             audioUseWatcher?.stop()
             audioUseWatcher = nil
+            nowPlayingWatcher?.stop()
+            nowPlayingWatcher = nil
+            nowPlayingClient = nil
+            nowPlayingStatus = "未监听"
             appWants = false
             appWantedPID = nil
             activeAudioUseSignals.removeAll()
@@ -530,12 +538,23 @@ final class AppModel: ObservableObject {
             autoMutedUntilSourcesEnd = false
             if kind == .callKit { voipCallActive = true }
 
-            guard let pid = watchedAppPID() else {
+            // The configured Bundle ID match is the first try; the MediaRemote now-playing
+            // app is the same second source the analysed daemon uses, so a call can be
+            // found from the audio it is producing without configuration.
+            var resolvedPID = watchedAppPID()
+            if resolvedPID == nil, let playing = nowPlayingClient, playing.isPlaying,
+               kind == .callKit || watchedIdentifiers.contains(playing.bundleIdentifier.lowercased()) {
+                resolvedPID = playing.pid
+                trlog(.info, "APP", "Bundle ID 未匹配，改用正在播放的 App："
+                      + "\(playing.bundleIdentifier) pid \(playing.pid)")
+            }
+
+            guard let pid = resolvedPID else {
                 if kind == .callKit {
                     activeAudioUseSignals.insert(kind.rawValue)
                     appWants = true
                     appWantedPID = nil
-                    trlog(.info, "APP", "CallKit 通话接通，但未匹配到监听的 App：回退到系统音频")
+                    trlog(.info, "APP", "CallKit 通话接通，但未匹配到 App：回退到系统音频")
                     reevaluate()
                 } else {
                     trlog(.info, "APP", "\(kind.rawValue) 来自未监听的 App，且未匹配到 Bundle ID，忽略")
@@ -558,6 +577,40 @@ final class AppModel: ObservableObject {
             appWants = false
             appWantedPID = nil
             appIdleTicks = 0
+            reevaluate()
+        }
+    }
+
+    /// Mirrors the analysed daemon's setupMediaRemoteObservers: learn which application is
+    /// producing audio right now, so its pid can be used as the tap target.
+    @discardableResult
+    private func startNowPlayingWatcher() -> Bool {
+        guard nowPlayingWatcher == nil else { return true }
+        let watcher = NowPlayingWatcher()
+        watcher.onClientChanged = { [weak self] client in
+            Task { @MainActor in self?.handleNowPlaying(client) }
+        }
+        guard watcher.start() else {
+            nowPlayingStatus = "启动失败（\(watcher.statusDetail)）"
+            return false
+        }
+        nowPlayingWatcher = watcher
+        nowPlayingStatus = watcher.statusDetail
+        return true
+    }
+
+    private func handleNowPlaying(_ client: NowPlayingWatcher.Client?) {
+        nowPlayingClient = client
+        guard let client else {
+            nowPlayingStatus = "无"
+            return
+        }
+        nowPlayingStatus = "\(client.displayName) pid \(client.pid)"
+
+        // If a call is up but the target was not identified yet, the now-playing app is it.
+        if watchApps, appWants, appWantedPID == nil, callActive || !activeAudioUseSignals.isEmpty {
+            appWantedPID = client.pid
+            trlog(.info, "APP", "用正在播放的 App 作为 tap 目标：pid \(client.pid) [\(client.bundleIdentifier)]")
             reevaluate()
         }
     }
@@ -810,6 +863,7 @@ struct ContentView: View {
                     InfoRow(title: "私有 tap", value: model.tapAvailability)
                     InfoRow(title: "音频进程枚举(诊断)", value: model.audioProcessStatus)
                     InfoRow(title: "应用音频监听", value: model.appAudioStatus)
+                    InfoRow(title: "正在播放音频", value: model.nowPlayingStatus)
                     InfoRow(title: "按键事件源", value: model.keyStatus)
                     InfoRow(title: "当前目标", value: model.effectiveTarget().label)
                     InfoRow(title: "当前文件", value: model.currentFile)
