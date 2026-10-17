@@ -16,6 +16,15 @@ import Foundation
 import UIKit
 
 enum Privacy {
+    /// Keeps only the last four digits of a phone number. Nil or too-short values become a
+    /// fixed mask, so a caller is still countable but not identifiable.
+    static func maskPhone(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "-" }
+        let digits = value.filter { $0.isNumber }
+        guard digits.count > 4 else { return "****" }
+        return String(repeating: "*", count: digits.count - 4) + String(digits.suffix(4))
+    }
+
     static func redact(_ text: String) -> String {
         var result = text
 

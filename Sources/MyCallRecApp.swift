@@ -122,8 +122,6 @@ final class AppModel: ObservableObject {
     /// uses a private API, so it is opt-in and testable before being trusted.
     @Published var autoMuteCallMic = false
     @Published var callMuteStatus = "-"
-    /// Mask phone numbers / contact names / the device name in the copied log.
-    @Published var redactLogs = true
     /// m4a/AAC by default (small files); caf keeps the lossless PCM the tap delivers.
     @Published var recordingFormat: RecordingFormat = .m4a
 
@@ -885,8 +883,11 @@ final class AppModel: ObservableObject {
                                   outgoing: event.isOutgoing,
                                   state: event.state.label)
         }
-        trlog(.info, "CT", "通话事件 \(event.state.label) 号码=\(event.address ?? "-") 名称=\(event.displayName ?? "-") "
-              + "类型=\(event.callType ?? "-") 去电=\(event.isOutgoing.map { $0 ? "是" : "否" } ?? "-") 并发=\(event.activeCallCount)")
+        // The number is masked and the contact name is never written: the log is copied off
+        // the device often and must not carry a caller's identity.
+        trlog(.info, "CT", "通话事件 \(event.state.label) 号码=\(Privacy.maskPhone(event.address)) "
+              + "名称=\(event.displayName == nil ? "-" : "已隐藏") 类型=\(event.callType ?? "-") "
+              + "去电=\(event.isOutgoing.map { $0 ? "是" : "否" } ?? "-") 并发=\(event.activeCallCount)")
 
         guard watchCalls else { return }
 
@@ -979,20 +980,18 @@ final class AppModel: ObservableObject {
             trlog(.warn, "APP", "正在录音，跳过 tap 自检")
         }
         trlog(.info, "APP", "开始收集诊断快照（tap 自检=\(selfTest)）")
-        let redact = redactLogs
         DispatchQueue.global(qos: .userInitiated).async {
             let snapshot = Diagnostics.collect(includeTapSelfTest: selfTest)
             DispatchQueue.main.async {
-                UIPasteboard.general.string = redact ? Privacy.redact(snapshot.text) : snapshot.text
-                trlog(.info, "APP", "诊断快照已复制到剪贴板（\(snapshot.text.count) 字符，脱敏=\(redact)）；原始 JSON 在 Documents/logs/")
+                UIPasteboard.general.string = Privacy.redact(snapshot.text)
+                trlog(.info, "APP", "诊断快照已复制到剪贴板（\(snapshot.text.count) 字符，已脱敏）")
             }
         }
     }
 
     func copyLogToPasteboard() {
-        let text = Log.shared.transcript()
-        UIPasteboard.general.string = redactLogs ? Privacy.redact(text) : text
-        trlog(.info, "APP", "日志已复制到剪贴板（\(Log.shared.lines.count) 行，脱敏=\(redactLogs)）")
+        UIPasteboard.general.string = Privacy.redact(Log.shared.transcript())
+        trlog(.info, "APP", "日志已复制到剪贴板（\(Log.shared.lines.count) 行，已脱敏）")
     }
 
     func clearLog() {
@@ -1162,8 +1161,7 @@ struct ContentView: View {
                     Button("仅复制状态（不做 tap 测试）") { model.runDiagnostics(includeSelfTest: false) }
                     Text("快照包含：TrollStore 实际授予的 entitlements、私有 tap 选择子、CoreTelephony 结果、音频进程全表、音频会话状态，外加运行日志。粘贴给我即可。")
                         .font(.caption2).foregroundColor(.secondary)
-                    Toggle("复制时脱敏（号码/联系人/设备名）", isOn: $model.redactLogs)
-                    Text("日志里会出现通话号码、联系人名称、录音路径等；不含 UDID/序列号/Apple ID/设备名。打开开关后复制的内容会把号码只保留后四位、联系人名与设备名隐藏。原始日志文件本身不脱敏。")
+                    Text("日志已脱敏：通话号码只保留后 4 位、不记录联系人名称、不记录设备名/蓝牙名称；不含 UDID/序列号/Apple ID。复制日志与诊断快照会再脱敏一次。")
                         .font(.caption2).foregroundColor(.secondary)
                 }
 
