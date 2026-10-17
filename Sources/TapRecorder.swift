@@ -334,13 +334,13 @@ public final class TapRecorder {
 
         var ref: ExtAudioFileRef?
         status = ExtAudioFileCreateWithURL(destination as CFURL, fileType, &fileFormat, nil,
-                                           AudioFileFlags.eraseFile, &ref)
+                                           AudioFileFlags.eraseFile.rawValue, &ref)
         if status != noErr, compress {
             trlog(.warn, "TAP", "m4a 创建失败：\(status) \(Self.fourCC(status))，回退为 CAF/LPCM")
             fileType = kAudioFileCAFType
             fileFormat = clientFormat
             status = ExtAudioFileCreateWithURL(destination as CFURL, fileType, &fileFormat, nil,
-                                               AudioFileFlags.eraseFile, &ref)
+                                               AudioFileFlags.eraseFile.rawValue, &ref)
         }
         guard status == noErr, let ref else {
             trlog(.error, "TAP", "ExtAudioFileCreateWithURL 失败：\(status) \(Self.fourCC(status))；"
